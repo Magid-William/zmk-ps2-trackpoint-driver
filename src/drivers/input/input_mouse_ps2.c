@@ -1974,13 +1974,13 @@ DT_INST_FOREACH_STATUS_OKAY(PS2_MOUSE_CALLBACK_DEFINE)
     };                                                                                        \
     static const struct zmk_mouse_ps2_config config##n = {                                    \
         .ps2_device = DEVICE_DT_GET(DT_INST_PHANDLE(n, ps2_device)),                          \
-        .has_rst_gpio = DT_INST_NODE_HAS_PROP(n, rst_gpio),                                   \
+        .has_rst_gpio = DT_INST_NODE_HAS_PROP(n, rst_gpios),                                  \
         .rst_gpio = COND_CODE_1(                                                              \
-            DT_INST_NODE_HAS_PROP(n, rst_gpio),                                               \
+            DT_INST_NODE_HAS_PROP(n, rst_gpios),                                              \
             (GPIO_DT_SPEC_INST_GET(n, rst_gpios)),                                            \
             ({ .port = NULL, .pin = 0, .dt_flags = 0, })),                                    \
         .rst_gpio_port_num = COND_CODE_1(                                                     \
-            DT_INST_NODE_HAS_PROP(n, rst_gpio),                                               \
+            DT_INST_NODE_HAS_PROP(n, rst_gpios),                                              \
             (DT_PROP(DT_INST_PHANDLE(n, rst_gpios), port)),                                   \
             (0)),                                                                             \
         .scroll_mode = DT_INST_PROP_OR(n, scroll_mode, false),                                \
