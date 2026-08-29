@@ -16,6 +16,17 @@ config PS2_GPIO_ENABLE_PS2_RESEND_CALLBACK
 	default n
 	select ZMK_INPUT_MOUSE_PS2_ENABLE_PS2_RESEND_CALLBACK
 
+config PS2_GPIO_WORK_QUEUE_CB_STACK_SIZE
+	int "Stack size of the PS/2 callback work queue thread"
+	default 1024
+	help
+	  The callback work queue runs the zmk,input-mouse-ps2 data callback,
+	  which calls input_report_* on every complete packet. When the reports
+	  are forwarded through zmk,input-split - the split BLE transport (dongle
+	  topology), that call chain is deep and the default 1024 bytes can
+	  overflow, crashing the firmware. Raise this for such topologies;
+	  4096 is known to cover the input - split - BT path.
+
 # PS/2 events must be processed within 30-50us. Therefore we shift the
 # BT_CTLR_LLL_PRIO from 0 to 1 and BT_CTLR_ULL_* priorities from 1 to 2.
 # We then set the gpio priority to 0.
