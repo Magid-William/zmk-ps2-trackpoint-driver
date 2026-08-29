@@ -16,6 +16,17 @@ config ZMK_INPUT_MOUSE_PS2_ENABLE_PS2_RESEND_CALLBACK
 
 if ZMK_INPUT_MOUSE_PS2
 
+config ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS
+	bool "Never send any host commands to the PS/2 device"
+	default n
+	help
+	  For PS/2 devices that stream data immediately on power-up and reject
+	  all host commands (e.g. certain generic trackpoints). Skips the
+	  self-test/reset/identification/config handshake, never requests
+	  resends, and never writes the enable/disable-reporting commands.
+	  With this mode the trackpoint tuning props and the &mms behavior are
+	  no-ops.
+
 config ZMK_INPUT_MOUSE_PS2_POWER_ON_RESET_TIME
     int "The POR shall be timed to occur 600 ms ± 20 % from the time power is applied to the TrackPoint controller."
     default 600
@@ -36,5 +47,62 @@ config ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN
     help
       Default minimum report interval in milliseconds.
       Slow down input reporting for hid queue over the air.
+
+config ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR
+	int "Divide all movement reports by this value (remainder accumulates)"
+	default 1
+	range 1 255
+	help
+	  Scales the pointer speed down without losing small movements: raw
+	  deltas are accumulated and only whole multiples of the divisor are
+	  reported, so sub-divisor motion is batched instead of dropped.
+	  1 = unchanged.
+
+config ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N
+	int "Exponential moving average window for movement deltas"
+	default 1
+	range 1 32
+	help
+	  Dampens per-bit decode wobble from glitchy decoders (an errored bit 7
+	  flips a delta between +127/-128 on near-identical bytes, which makes
+	  the cursor erratic). 1 = off; 8 dampens spikes ~8x while preserving
+	  slow motion.
+
+config ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW
+	int "Median filter window for movement deltas (0, 1 = off, 3, 5)"
+	default 1
+	range 0 5
+	help
+	  Kills spike bursts from decode packet-boundary slips (which inject
+	  full-scale jumps into real motion, usually in bursts of 2-3 packets).
+	  5 = median of the last 5 deltas per axis; 3 = median of the last 3.
+
+config ZMK_INPUT_MOUSE_PS2_SLEW_MAX
+	int "Reject isolated deltas larger than this (0 = off)"
+	default 0
+	range 0 255
+	help
+	  Slew-rate limiter: a delta above SLEW_MAX is only reported if the
+	  previous report also exceeded it, so a sustained fast flick is kept
+	  while a lone spike is treated as a decode glitch.
+
+config ZMK_INPUT_MOUSE_PS2_TELEMETRY
+	bool "Print 1s decode counters (input driver + ps2-gpio backend)"
+	default n
+	help
+	  Prints a one-per-second counter line (bytes, packets, alignment
+	  aborts, buffer timeouts and the ps2-gpio decode aborts) to help
+	  diagnose transmission problems. Off by default.
+
+config ZMK_INPUT_MOUSE_PS2_POWER_CURVE
+	bool "RawAccel-style Power velocity curve in the input driver"
+	default n
+	help
+	  Applies a per-sample velocity curve to the movement deltas before the
+	  divisor/report stage: f(v) = start + (rate * v)^exponent with
+	  v = |(x,y)| per packet. Enabled per device by setting curve-rate on
+	  the zmk,input-mouse-ps2 node (0 keeps the raw stream). Compiles
+	  power_curve.c, which calls float pow() at init; NEWLIB libc is known
+	  to work with it.
 
 endif # ZMK_INPUT_MOUSE_PS2

@@ -20,12 +20,21 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+#include "power_curve.h"
+#endif
+
 /*
  * Settings
  */
 
 // Delay mouse init to give the mouse time to send the init sequence.
 #define ZMK_MOUSE_PS2_INIT_THREAD_DELAY_MS 1000
+
+// In no-commands mode, how long to wait for the device to power up and
+// start streaming before enabling the data callback.
+// (TrackPoint POR = 600 ms ± 20 %; a little margin on top.)
+#define ZMK_MOUSE_PS2_NO_COMMANDS_INIT_DELAY_MS 1500
 
 // How often the driver try to initialize a mouse before we give up.
 #define MOUSE_PS2_INIT_ATTEMPTS 10
@@ -150,6 +159,31 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  * Global Variables
  */
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+
+/*
+ * Packet-assembly telemetry: a 1s counter line (LOG_INF) that shows where the
+ * decoder is losing bytes. Off by default.
+ */
+struct ps2_mouse_stats {
+    uint32_t bytes;         /* bytes received via the ps2 callback */
+    uint32_t packets;       /* complete packets parsed */
+    uint32_t align_aborts;  /* bit-3 alignment drops */
+    uint32_t buf_timeouts;  /* packet-buffer timeout resets */
+};
+
+static struct ps2_mouse_stats ps2_mouse_stats;
+
+static struct k_work_delayable ps2_mouse_stats_work;
+
+static void ps2_mouse_stats_print(struct k_work *item) {
+    LOG_INF("ps2_mouse: bytes=%u pkts=%u align_abort=%u buf_to=%u", ps2_mouse_stats.bytes,
+            ps2_mouse_stats.packets, ps2_mouse_stats.align_aborts, ps2_mouse_stats.buf_timeouts);
+    k_work_schedule(&ps2_mouse_stats_work, K_SECONDS(1));
+}
+
+#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY) */
+
 #define MOUSE_PS2_SETTINGS_SUBTREE "mouse_ps2"
 
 typedef enum {
@@ -175,6 +209,15 @@ struct zmk_mouse_ps2_config {
     bool tp_x_invert;
     bool tp_y_invert;
     bool tp_xy_swap;
+
+    // On-device PowerCurve (raw stream otherwise). curve_rate != 0 enables
+    // it; sens/rate/exp/start are Q8.8. Only used when
+    // CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE is enabled.
+    bool curve_enabled;
+    uint8_t curve_sens;
+    uint16_t curve_rate;
+    uint16_t curve_exponent;
+    uint16_t curve_start;
 };
 
 struct zmk_mouse_ps2_packet {
@@ -207,6 +250,36 @@ struct zmk_mouse_ps2_data {
     bool button_l_is_held;
     bool button_m_is_held;
     bool button_r_is_held;
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 3
+    // Median filter ring per axis (spike killer)
+    int16_t mf_x[5];
+    int16_t mf_y[5];
+    uint8_t mf_i;
+#endif
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX > 0
+    // Slew-rate gate state (last reported values)
+    int16_t last_x;
+    int16_t last_y;
+#endif
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N > 1
+    // EMA low-pass state for the movement deltas
+    int32_t ema_x;
+    int32_t ema_y;
+#endif
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR > 1
+    // Speed-divisor fractional-remainder accumulators
+    int64_t rem_x;
+    int64_t rem_y;
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+    // On-device PowerCurve state (LUT + fractional remainders)
+    struct power_curve curve;
+#endif
 
     bool activity_reporting_on;
     bool is_trackpoint;
@@ -273,6 +346,10 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
                                      const struct device *ps2_device, uint8_t byte) {
     struct zmk_mouse_ps2_data *data = dev->data;
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.bytes++;
+#endif
+
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
     // LOG_DBG("Received mouse movement data: 0x%x", byte);
@@ -314,12 +391,26 @@ void zmk_mouse_ps2_activity_abort_cmd(const struct device *dev, char *reason) {
     const struct zmk_mouse_ps2_config *config = dev->config;
     const struct device *ps2_device = config->ps2_device;
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.align_aborts++;
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // Command-rejecting devices (which stream on power-up) never ACK a resend
+    // request; writing 0xFE would inhibit the clock line and corrupt the live
+    // stream. Drop the partial packet and resync on the next valid start bit.
+    LOG_ERR("PS/2 Mouse cmd buffer is out of alignment. Dropping partial packet: %s", reason);
+
+    data->packet_idx = 0;
+    zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+#else
     LOG_ERR("PS/2 Mouse cmd buffer is out of aligment. Requesting resend: %s", reason);
 
     data->packet_idx = 0;
     ps2_write(ps2_device, MOUSE_PS2_CMD_RESEND[0]);
 
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+#endif
 }
 
 // Called if the PS/2 driver encounters a transmission error and asks the
@@ -352,6 +443,10 @@ void zmk_mouse_ps2_activity_packet_timout(struct k_work *item) {
 
     LOG_DBG("Mouse movement cmd timed out on idx=%d", data->packet_idx);
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.buf_timeouts++;
+#endif
+
     // Reset the cmd buffer in case we are out of alignment.
     // This way if the mouse ever gets out of alignment, the user
     // can reset it by just not moving it for a second.
@@ -370,6 +465,11 @@ void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
                                         uint8_t packet_x, uint8_t packet_y, uint8_t packet_extra) {
     struct zmk_mouse_ps2_data *data = dev->data;
     struct zmk_mouse_ps2_packet packet;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.packets++;
+#endif
+
     packet = zmk_mouse_ps2_activity_parse_packet_buffer(packet_mode, packet_state, packet_x,
                                                         packet_y, packet_extra);
 
@@ -427,6 +527,15 @@ zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode
     packet.overflow_y = MOUSE_PS2_GET_BIT(packet_state, 7);
     packet.scroll = 0;
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // Some command-rejecting trackpoints send a status byte that decodes
+    // unreliably while the X/Y data bytes come out clean. Don't trust its
+    // sign bits - decode the raw data bytes as two's-complement int8
+    // instead. Deltas fit in +/-127, so 0xC4 -> -60, 0xFF -> -1.
+    packet.mov_x = (int8_t)packet_x;
+    packet.mov_y = (int8_t)packet_y;
+#else
+
     // The coordinates are delivered as a signed 9bit integers.
     // But a PS/2 packet is only 8 bits, so the most significant
     // bit with the sign is stored inside the state packet.
@@ -449,6 +558,7 @@ zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode
     // https://wiki.osdev.org/PS/2_Mouse
     packet.mov_x = packet_x - ((packet_state << 4) & 0x100);
     packet.mov_y = packet_y - ((packet_state << 3) & 0x100);
+#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS) */
 
     // If packet mode scroll or scroll+5 buttons is used,
     // then the first 4 bit of the extra byte are used for the
@@ -470,13 +580,132 @@ zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode
 
 static bool zmk_mouse_ps2_is_non_zero_1d_movement(int16_t speed) { return speed != 0; }
 
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 5
+
+// Median of five signed values
+static int16_t zmk_mouse_ps2_median5(int16_t a, int16_t b, int16_t c, int16_t d,
+                                     int16_t e) {
+    // insertion sort and pick the middle value
+    int16_t buf[5] = {a, b, c, d, e};
+    for (int i = 1; i < 5; i++) {
+        int16_t key = buf[i];
+        int j = i - 1;
+        while (j >= 0 && buf[j] > key) {
+            buf[j + 1] = buf[j];
+            j--;
+        }
+        buf[j + 1] = key;
+    }
+    return buf[2];
+}
+
+#elif CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 3
+
+// Median of three signed values
+static int16_t zmk_mouse_ps2_median3(int16_t a, int16_t b, int16_t c) {
+    if ((a > b) != (a > c)) {
+        return a;
+    } else if ((b > a) != (b > c)) {
+        return b;
+    } else {
+        return c;
+    }
+}
+
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW */
+
 void zmk_mouse_ps2_activity_move_mouse(const struct device *dev, int16_t mov_x, int16_t mov_y) {
     struct zmk_mouse_ps2_data *data = dev->data;
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+    const struct zmk_mouse_ps2_config *config = dev->config;
+#endif
     int ret = 0;
 
     bool have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
     bool have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
 
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 5
+    // The decode glitches come in bursts of 2-3 packets, so a window of 5
+    // reliably picks the true value around a spike.
+    data->mf_x[data->mf_i] = mov_x;
+    data->mf_y[data->mf_i] = mov_y;
+    data->mf_i = (data->mf_i + 1) % 5;
+    mov_x = zmk_mouse_ps2_median5(data->mf_x[0], data->mf_x[1], data->mf_x[2],
+                                  data->mf_x[3], data->mf_x[4]);
+    mov_y = zmk_mouse_ps2_median5(data->mf_y[0], data->mf_y[1], data->mf_y[2],
+                                  data->mf_y[3], data->mf_y[4]);
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#elif CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 3
+    // Median-3 erases single-packet spikes while preserving real motion.
+    data->mf_x[data->mf_i] = mov_x;
+    data->mf_y[data->mf_i] = mov_y;
+    data->mf_i = (data->mf_i + 1) % 3;
+    mov_x = zmk_mouse_ps2_median3(data->mf_x[0], data->mf_x[1], data->mf_x[2]);
+    mov_y = zmk_mouse_ps2_median3(data->mf_y[0], data->mf_y[1], data->mf_y[2]);
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW */
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX > 0
+    // Slew-rate gate: a lone big delta is a decode glitch; a sustained big
+    // delta is a real fast flick (maintained over several packets).
+    if (mov_x > CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX && data->last_x <= CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX) {
+        mov_x = 0;
+    } else if (mov_x < -CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX &&
+               data->last_x >= -CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX) {
+        mov_x = 0;
+    }
+    if (mov_y > CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX && data->last_y <= CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX) {
+        mov_y = 0;
+    } else if (mov_y < -CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX &&
+               data->last_y >= -CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX) {
+        mov_y = 0;
+    }
+    data->last_x = mov_x;
+    data->last_y = mov_y;
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX > 0 */
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N > 1
+    // EMA low-pass on the raw deltas: an errored bit-7 flips a delta between
+    // +127/-128 on nearly identical bytes, making the cursor erratic. The EMA
+    // dampens those spikes while keeping slow motion intact.
+    data->ema_x += mov_x - (data->ema_x / CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N);
+    data->ema_y += mov_y - (data->ema_y / CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N);
+    mov_x = data->ema_x / CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N;
+    mov_y = data->ema_y / CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N;
+    data->ema_x -= mov_x * CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N;
+    data->ema_y -= mov_y * CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N;
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N > 1 */
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+    if (config->curve_enabled) {
+        // On-device PowerCurve, applied to the (filtered) deltas before the
+        // divisor/report stage. Recomputed have_x/have_y so a delta the curve
+        // shrinks to 0 reports nothing (sparse reports, no flood).
+        power_curve_apply(&data->curve, mov_x, mov_y, &mov_x, &mov_y);
+        have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+        have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+    }
+#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE) */
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR > 1
+    // Scale the pointer speed to 1/divisor without losing small movements:
+    // accumulate raw deltas and only report whole multiples, keeping the
+    // remainder for the next packet.
+    data->rem_x += mov_x;
+    data->rem_y += mov_y;
+    mov_x = data->rem_x / CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR;
+    mov_y = data->rem_y / CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR;
+    data->rem_x -= mov_x * CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR;
+    data->rem_y -= mov_y * CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR;
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR > 1 */
 
 #if CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN > 0
 
@@ -498,11 +727,12 @@ void zmk_mouse_ps2_activity_move_mouse(const struct device *dev, int16_t mov_x, 
         last_rpt_time = now;
         if (have_x) {
             ret = input_report_rel(data->dev, INPUT_REL_X, adx, !have_y, K_NO_WAIT);
+            adx = 0;
         }
         if (have_y) {
             ret = input_report_rel(data->dev, INPUT_REL_Y, ady, true, K_NO_WAIT);
+            ady = 0;
         }
-        adx = ady = 0;
     }
 
 #else /* CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN > 0 */
@@ -752,12 +982,19 @@ int zmk_mouse_ps2_activity_reporting_enable(const struct device *dev) {
         return 0;
     }
 
+    int err = 0;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // Command-rejecting devices stream on power-up; writing the
+    // enable-reporting command would be rejected. Just enable the callback.
+#else
     uint8_t cmd = MOUSE_PS2_CMD_ENABLE_REPORTING[0];
-    int err = ps2_write(ps2_device, cmd);
+    err = ps2_write(ps2_device, cmd);
     if (err) {
         LOG_ERR("Could not enable data reporting: %d", err);
         return err;
     }
+#endif
 
     err = ps2_enable_callback(ps2_device);
     if (err) {
@@ -779,12 +1016,18 @@ int zmk_mouse_ps2_activity_reporting_disable(const struct device *dev) {
         return 0;
     }
 
+    int err = 0;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // Never write disable-reporting (it would be rejected anyway).
+#else
     uint8_t cmd = MOUSE_PS2_CMD_DISABLE_REPORTING[0];
-    int err = ps2_write(ps2_device, cmd);
+    err = ps2_write(ps2_device, cmd);
     if (err) {
         LOG_ERR("Could not disable data reporting: %d", err);
         return err;
     }
+#endif
 
     err = ps2_disable_callback(ps2_device);
     if (err) {
@@ -1693,16 +1936,36 @@ int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev);
 
 static int zmk_mouse_ps2_init(const struct device *dev) {
     struct zmk_mouse_ps2_data *data = dev->data;
-    // const struct zmk_mouse_ps2_config *config = dev->config;
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+    const struct zmk_mouse_ps2_config *config = dev->config;
+#endif
 
     LOG_DBG("Inside zmk_mouse_ps2_init");
     data->dev = dev;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+    // Init the on-device PowerCurve from DT props. rate = 0 keeps the
+    // identity LUT (f(v) = 1.0) and apply() is skipped entirely.
+    power_curve_init(&data->curve);
+    power_curve_set_param(&data->curve, config->curve_sens, config->curve_rate,
+                          config->curve_exponent, config->curve_start);
+    power_curve_update(&data->curve);
+    if (config->curve_enabled) {
+        LOG_INF("PowerCurve: sens=%d rate=%d exp=%d start=%d (Q8.8)", config->curve_sens,
+                config->curve_rate, config->curve_exponent, config->curve_start);
+    }
+#endif
 
     LOG_DBG("Creating mouse_ps2 init thread.");
     k_thread_create(&data->thread, data->thread_stack,
                     MOUSE_PS2_THREAD_STACK_SIZE, (k_thread_entry_t)zmk_mouse_ps2_init_thread,
                     (struct device *)dev, 0, NULL, K_PRIO_COOP(MOUSE_PS2_THREAD_PRIORITY), 0,
                     K_MSEC(ZMK_MOUSE_PS2_INIT_THREAD_DELAY_MS));
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    k_work_init_delayable(&ps2_mouse_stats_work, ps2_mouse_stats_print);
+    k_work_schedule(&ps2_mouse_stats_work, K_SECONDS(1));
+#endif
 
     return 0;
 }
@@ -1715,6 +1978,15 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
 
     zmk_mouse_ps2_init_power_on_reset(dev);
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // No-commands mode: the device streams data on power-up and rejects all
+    // host commands, so there is no self-test to wait for, no reset to send
+    // and no configuration to apply. Wait past the device's power-on reset
+    // (600 ms ± 20 %), then just enable the data callback.
+    LOG_INF("No-commands mode: waiting %d ms for the device to start streaming...",
+            ZMK_MOUSE_PS2_NO_COMMANDS_INIT_DELAY_MS);
+    k_sleep(K_MSEC(ZMK_MOUSE_PS2_NO_COMMANDS_INIT_DELAY_MS));
+#else
     LOG_INF("Waiting for mouse to connect...");
     err = zmk_mouse_ps2_init_wait_for_mouse(dev);
     if (err) {
@@ -1789,6 +2061,7 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         LOG_INF("Enabling scroll mode.");
         zmk_mouse_ps2_set_packet_mode(dev, MOUSE_PS2_PACKET_MODE_SCROLL);
     }
+#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS) */
 
     zmk_mouse_ps2_settings_init(dev);
 
@@ -1995,6 +2268,11 @@ DT_INST_FOREACH_STATUS_OKAY(PS2_MOUSE_CALLBACK_DEFINE)
         .tp_x_invert = DT_INST_PROP_OR(n, tp_x_invert, false),                                \
         .tp_y_invert = DT_INST_PROP_OR(n, tp_y_invert, false),                                \
         .tp_xy_swap = DT_INST_PROP_OR(n, tp_xy_swap, false),                                  \
+        .curve_enabled = DT_INST_PROP_OR(n, curve_rate, 0) != 0,                              \
+        .curve_sens = DT_INST_PROP_OR(n, curve_sens, 255),                                    \
+        .curve_rate = DT_INST_PROP_OR(n, curve_rate, 0),                                      \
+        .curve_exponent = DT_INST_PROP_OR(n, curve_exponent, 256),                            \
+        .curve_start = DT_INST_PROP_OR(n, curve_start, 256),                                  \
     };                                                                                        \
     DEVICE_DT_INST_DEFINE(n, &zmk_mouse_ps2_init, NULL, &data##n, &config##n,                 \
                         POST_KERNEL, ZMK_MOUSE_PS2_INIT_PRIORITY, NULL);

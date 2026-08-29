@@ -251,7 +251,13 @@ int ps2_uart_configure_pin_scl(const struct device *dev, gpio_flags_t flags, cha
 }
 
 int ps2_uart_configure_pin_scl_input(const struct device *dev) {
+#if IS_ENABLED(CONFIG_PS2_UART_INTERNAL_PULLUP)
+    // PS/2 CLK is open-drain; keep it pulled high when there is no external
+    // pull-up (directly-wired trackpoints).
+    return ps2_uart_configure_pin_scl(dev, (GPIO_INPUT | GPIO_PULL_UP), "input");
+#else
     return ps2_uart_configure_pin_scl(dev, (GPIO_INPUT), "input");
+#endif
 }
 
 int ps2_uart_configure_pin_scl_output(const struct device *dev) {
@@ -318,6 +324,13 @@ static int ps2_uart_set_mode_read(const struct device *dev) {
 
     // Make sure SCL interrupt is disabled
     ps2_uart_set_scl_callback_enabled(dev, false);
+
+#if IS_ENABLED(CONFIG_PS2_UART_INTERNAL_PULLUP)
+    // A write leaves the CLK line as an output; reconfigure it as input with
+    // the internal pull-up before each read so the open-drain device can
+    // actually drive the clock high (directly-wired trackpoints).
+    ps2_uart_configure_pin_scl_input(dev);
+#endif
 
     // Enable UART interrupt
     uart_irq_rx_enable(config->uart_dev);
@@ -1179,9 +1192,16 @@ int ps2_uart_read(const struct device *dev, uint8_t *value) {
 }
 
 static int ps2_uart_write(const struct device *dev, uint8_t value) {
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // No-commands mode: never initiate a host-to-device transmission.
+    // (The connected device rejects all host commands anyway.)
+    LOG_WRN("No-commands mode: refusing to send byte 0x%x", value);
+    return -ENOTSUP;
+#else
     int ret = ps2_uart_write_byte(dev, value);
 
     return ret;
+#endif
 }
 
 static int ps2_uart_disable_callback(const struct device *dev) {
