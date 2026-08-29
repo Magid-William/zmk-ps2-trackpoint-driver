@@ -48,4 +48,42 @@ config ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN
       Default minimum report interval in milliseconds.
       Slow down input reporting for hid queue over the air.
 
+config ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR
+	int "Divide all movement reports by this value (remainder accumulates)"
+	default 1
+	range 1 255
+	help
+	  Scales the pointer speed down without losing small movements: raw
+	  deltas are accumulated and only whole multiples of the divisor are
+	  reported, so sub-divisor motion is batched instead of dropped.
+	  1 = unchanged.
+
+config ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N
+	int "Exponential moving average window for movement deltas"
+	default 1
+	range 1 32
+	help
+	  Dampens per-bit decode wobble from glitchy decoders (an errored bit 7
+	  flips a delta between +127/-128 on near-identical bytes, which makes
+	  the cursor erratic). 1 = off; 8 dampens spikes ~8x while preserving
+	  slow motion.
+
+config ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW
+	int "Median filter window for movement deltas (0, 1 = off, 3, 5)"
+	default 1
+	range 0 5
+	help
+	  Kills spike bursts from decode packet-boundary slips (which inject
+	  full-scale jumps into real motion, usually in bursts of 2-3 packets).
+	  5 = median of the last 5 deltas per axis; 3 = median of the last 3.
+
+config ZMK_INPUT_MOUSE_PS2_SLEW_MAX
+	int "Reject isolated deltas larger than this (0 = off)"
+	default 0
+	range 0 255
+	help
+	  Slew-rate limiter: a delta above SLEW_MAX is only reported if the
+	  previous report also exceeded it, so a sustained fast flick is kept
+	  while a lone spike is treated as a decode glitch.
+
 endif # ZMK_INPUT_MOUSE_PS2

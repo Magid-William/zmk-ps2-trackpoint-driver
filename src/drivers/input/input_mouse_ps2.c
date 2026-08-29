@@ -213,6 +213,31 @@ struct zmk_mouse_ps2_data {
     bool button_m_is_held;
     bool button_r_is_held;
 
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 3
+    // Median filter ring per axis (spike killer)
+    int16_t mf_x[5];
+    int16_t mf_y[5];
+    uint8_t mf_i;
+#endif
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX > 0
+    // Slew-rate gate state (last reported values)
+    int16_t last_x;
+    int16_t last_y;
+#endif
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N > 1
+    // EMA low-pass state for the movement deltas
+    int32_t ema_x;
+    int32_t ema_y;
+#endif
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR > 1
+    // Speed-divisor fractional-remainder accumulators
+    int64_t rem_x;
+    int64_t rem_y;
+#endif
+
     bool activity_reporting_on;
     bool is_trackpoint;
     uint8_t manufacturer_id;
@@ -495,6 +520,40 @@ zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode
 
 static bool zmk_mouse_ps2_is_non_zero_1d_movement(int16_t speed) { return speed != 0; }
 
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 5
+
+// Median of five signed values
+static int16_t zmk_mouse_ps2_median5(int16_t a, int16_t b, int16_t c, int16_t d,
+                                     int16_t e) {
+    // insertion sort and pick the middle value
+    int16_t buf[5] = {a, b, c, d, e};
+    for (int i = 1; i < 5; i++) {
+        int16_t key = buf[i];
+        int j = i - 1;
+        while (j >= 0 && buf[j] > key) {
+            buf[j + 1] = buf[j];
+            j--;
+        }
+        buf[j + 1] = key;
+    }
+    return buf[2];
+}
+
+#elif CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 3
+
+// Median of three signed values
+static int16_t zmk_mouse_ps2_median3(int16_t a, int16_t b, int16_t c) {
+    if ((a > b) != (a > c)) {
+        return a;
+    } else if ((b > a) != (b > c)) {
+        return b;
+    } else {
+        return c;
+    }
+}
+
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW */
+
 void zmk_mouse_ps2_activity_move_mouse(const struct device *dev, int16_t mov_x, int16_t mov_y) {
     struct zmk_mouse_ps2_data *data = dev->data;
     int ret = 0;
@@ -502,6 +561,77 @@ void zmk_mouse_ps2_activity_move_mouse(const struct device *dev, int16_t mov_x, 
     bool have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
     bool have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
 
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 5
+    // The decode glitches come in bursts of 2-3 packets, so a window of 5
+    // reliably picks the true value around a spike.
+    data->mf_x[data->mf_i] = mov_x;
+    data->mf_y[data->mf_i] = mov_y;
+    data->mf_i = (data->mf_i + 1) % 5;
+    mov_x = zmk_mouse_ps2_median5(data->mf_x[0], data->mf_x[1], data->mf_x[2],
+                                  data->mf_x[3], data->mf_x[4]);
+    mov_y = zmk_mouse_ps2_median5(data->mf_y[0], data->mf_y[1], data->mf_y[2],
+                                  data->mf_y[3], data->mf_y[4]);
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#elif CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 3
+    // Median-3 erases single-packet spikes while preserving real motion.
+    data->mf_x[data->mf_i] = mov_x;
+    data->mf_y[data->mf_i] = mov_y;
+    data->mf_i = (data->mf_i + 1) % 3;
+    mov_x = zmk_mouse_ps2_median3(data->mf_x[0], data->mf_x[1], data->mf_x[2]);
+    mov_y = zmk_mouse_ps2_median3(data->mf_y[0], data->mf_y[1], data->mf_y[2]);
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW */
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX > 0
+    // Slew-rate gate: a lone big delta is a decode glitch; a sustained big
+    // delta is a real fast flick (maintained over several packets).
+    if (mov_x > CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX && data->last_x <= CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX) {
+        mov_x = 0;
+    } else if (mov_x < -CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX &&
+               data->last_x >= -CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX) {
+        mov_x = 0;
+    }
+    if (mov_y > CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX && data->last_y <= CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX) {
+        mov_y = 0;
+    } else if (mov_y < -CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX &&
+               data->last_y >= -CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX) {
+        mov_y = 0;
+    }
+    data->last_x = mov_x;
+    data->last_y = mov_y;
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX > 0 */
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N > 1
+    // EMA low-pass on the raw deltas: an errored bit-7 flips a delta between
+    // +127/-128 on nearly identical bytes, making the cursor erratic. The EMA
+    // dampens those spikes while keeping slow motion intact.
+    data->ema_x += mov_x - (data->ema_x / CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N);
+    data->ema_y += mov_y - (data->ema_y / CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N);
+    mov_x = data->ema_x / CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N;
+    mov_y = data->ema_y / CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N;
+    data->ema_x -= mov_x * CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N;
+    data->ema_y -= mov_y * CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N;
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N > 1 */
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR > 1
+    // Scale the pointer speed to 1/divisor without losing small movements:
+    // accumulate raw deltas and only report whole multiples, keeping the
+    // remainder for the next packet.
+    data->rem_x += mov_x;
+    data->rem_y += mov_y;
+    mov_x = data->rem_x / CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR;
+    mov_y = data->rem_y / CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR;
+    data->rem_x -= mov_x * CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR;
+    data->rem_y -= mov_y * CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR;
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR > 1 */
 
 #if CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN > 0
 
