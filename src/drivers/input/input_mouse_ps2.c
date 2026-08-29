@@ -20,6 +20,10 @@
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+#include "power_curve.h"
+#endif
+
 /*
  * Settings
  */
@@ -205,6 +209,15 @@ struct zmk_mouse_ps2_config {
     bool tp_x_invert;
     bool tp_y_invert;
     bool tp_xy_swap;
+
+    // On-device PowerCurve (raw stream otherwise). curve_rate != 0 enables
+    // it; sens/rate/exp/start are Q8.8. Only used when
+    // CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE is enabled.
+    bool curve_enabled;
+    uint8_t curve_sens;
+    uint16_t curve_rate;
+    uint16_t curve_exponent;
+    uint16_t curve_start;
 };
 
 struct zmk_mouse_ps2_packet {
@@ -261,6 +274,11 @@ struct zmk_mouse_ps2_data {
     // Speed-divisor fractional-remainder accumulators
     int64_t rem_x;
     int64_t rem_y;
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+    // On-device PowerCurve state (LUT + fractional remainders)
+    struct power_curve curve;
 #endif
 
     bool activity_reporting_on;
@@ -598,6 +616,9 @@ static int16_t zmk_mouse_ps2_median3(int16_t a, int16_t b, int16_t c) {
 
 void zmk_mouse_ps2_activity_move_mouse(const struct device *dev, int16_t mov_x, int16_t mov_y) {
     struct zmk_mouse_ps2_data *data = dev->data;
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+    const struct zmk_mouse_ps2_config *config = dev->config;
+#endif
     int ret = 0;
 
     bool have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
@@ -660,6 +681,17 @@ void zmk_mouse_ps2_activity_move_mouse(const struct device *dev, int16_t mov_x, 
     have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
     have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
 #endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N > 1 */
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+    if (config->curve_enabled) {
+        // On-device PowerCurve, applied to the (filtered) deltas before the
+        // divisor/report stage. Recomputed have_x/have_y so a delta the curve
+        // shrinks to 0 reports nothing (sparse reports, no flood).
+        power_curve_apply(&data->curve, mov_x, mov_y, &mov_x, &mov_y);
+        have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+        have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+    }
+#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE) */
 
 #if CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR > 1
     // Scale the pointer speed to 1/divisor without losing small movements:
@@ -1900,10 +1932,25 @@ int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev);
 
 static int zmk_mouse_ps2_init(const struct device *dev) {
     struct zmk_mouse_ps2_data *data = dev->data;
-    // const struct zmk_mouse_ps2_config *config = dev->config;
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+    const struct zmk_mouse_ps2_config *config = dev->config;
+#endif
 
     LOG_DBG("Inside zmk_mouse_ps2_init");
     data->dev = dev;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE)
+    // Init the on-device PowerCurve from DT props. rate = 0 keeps the
+    // identity LUT (f(v) = 1.0) and apply() is skipped entirely.
+    power_curve_init(&data->curve);
+    power_curve_set_param(&data->curve, config->curve_sens, config->curve_rate,
+                          config->curve_exponent, config->curve_start);
+    power_curve_update(&data->curve);
+    if (config->curve_enabled) {
+        LOG_INF("PowerCurve: sens=%d rate=%d exp=%d start=%d (Q8.8)", config->curve_sens,
+                config->curve_rate, config->curve_exponent, config->curve_start);
+    }
+#endif
 
     LOG_DBG("Creating mouse_ps2 init thread.");
     k_thread_create(&data->thread, data->thread_stack,
@@ -2217,6 +2264,11 @@ DT_INST_FOREACH_STATUS_OKAY(PS2_MOUSE_CALLBACK_DEFINE)
         .tp_x_invert = DT_INST_PROP_OR(n, tp_x_invert, false),                                \
         .tp_y_invert = DT_INST_PROP_OR(n, tp_y_invert, false),                                \
         .tp_xy_swap = DT_INST_PROP_OR(n, tp_xy_swap, false),                                  \
+        .curve_enabled = DT_INST_PROP_OR(n, curve_rate, 0) != 0,                          \
+        .curve_sens = DT_INST_PROP_OR(n, curve_sens, 255),                                \
+        .curve_rate = DT_INST_PROP_OR(n, curve_rate, 0),                                  \
+        .curve_exponent = DT_INST_PROP_OR(n, curve_exponent, 256),                        \
+        .curve_start = DT_INST_PROP_OR(n, curve_start, 256),                              \
     };                                                                                        \
     DEVICE_DT_INST_DEFINE(n, &zmk_mouse_ps2_init, NULL, &data##n, &config##n,                 \
                         POST_KERNEL, ZMK_MOUSE_PS2_INIT_PRIORITY, NULL);

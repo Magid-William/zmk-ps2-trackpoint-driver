@@ -70,3 +70,39 @@ properties:
     type: int
     required: false
     description: The layer that should be toggled when the mouse is moved.
+
+  curve-sens:
+    type: int
+    required: false
+    description: |
+      PowerCurve sensitivity multiplier (Q8.8, 255 = 1.0). Scales the whole
+      curve - the "loudness" knob. Only used when curve-rate is non-zero and
+      CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE is enabled.
+
+  curve-rate:
+    type: int
+    required: false
+    default: 0
+    description: |
+      PowerCurve rate constant (Q8.8, e.g. 18 = 0.070). A non-zero value
+      enables the curve: f(v) = start + (rate * v)^exponent where v = |(x,y)|
+      per input packet (RawAccel "Power", whole mode). 0 keeps the raw stream
+      (curve disabled) - the safe identity default. Only active when
+      CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE is enabled.
+
+  curve-exponent:
+    type: int
+    required: false
+    default: 256
+    description: |
+      PowerCurve exponent (Q8.8, 256 = 1.0). Shapes how fast the gain rises
+      with speed. Only used when curve-rate is non-zero.
+
+  curve-start:
+    type: int
+    required: false
+    default: 256
+    description: |
+      PowerCurve output offset (Q8.8, 256 = 1.0) - the gain at v=0, the
+      precision knob. Lower start = more attenuation of slow deltas. Only
+      used when curve-rate is non-zero.

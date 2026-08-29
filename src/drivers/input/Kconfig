@@ -94,4 +94,15 @@ config ZMK_INPUT_MOUSE_PS2_TELEMETRY
 	  aborts, buffer timeouts and the ps2-gpio decode aborts) to help
 	  diagnose transmission problems. Off by default.
 
+config ZMK_INPUT_MOUSE_PS2_POWER_CURVE
+	bool "RawAccel-style Power velocity curve in the input driver"
+	default n
+	help
+	  Applies a per-sample velocity curve to the movement deltas before the
+	  divisor/report stage: f(v) = start + (rate * v)^exponent with
+	  v = |(x,y)| per packet. Enabled per device by setting curve-rate on
+	  the zmk,input-mouse-ps2 node (0 keeps the raw stream). Compiles
+	  power_curve.c, which calls float pow() at init; NEWLIB libc is known
+	  to work with it.
+
 endif # ZMK_INPUT_MOUSE_PS2
