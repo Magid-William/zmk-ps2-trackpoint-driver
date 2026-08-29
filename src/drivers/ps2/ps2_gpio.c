@@ -235,6 +235,40 @@ static struct k_work_q ps2_gpio_work_queue;
 K_THREAD_STACK_DEFINE(ps2_gpio_work_queue_cb_stack_area, PS2_GPIO_WORK_QUEUE_CB_STACK_SIZE);
 static struct k_work_q ps2_gpio_work_queue_cb;
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+
+/*
+ * Decode telemetry: a 1s counter line (LOG_INF) that shows exactly where the
+ * decoder is aborting. Off by default.
+ */
+struct ps2_gpio_stats {
+    uint32_t read_ints;          /* CLK falling edges processed in read mode */
+    uint32_t aborts;             /* total read aborts */
+    uint32_t abort_missed;       /* missed interrupt (cycle delta > max) */
+    uint32_t abort_start;        /* invalid start bit */
+    uint32_t abort_parity;       /* invalid parity bit */
+    uint32_t abort_stop;         /* invalid stop bit */
+    uint32_t abort_timeout;      /* SCL read timeout */
+    uint32_t resends_suppressed; /* 0xFE writes suppressed */
+    uint32_t delivered;          /* bytes handed to the ps2 callback/queue */
+};
+
+static struct ps2_gpio_stats ps2_gpio_stats;
+
+static struct k_work_delayable ps2_gpio_stats_work;
+
+static void ps2_gpio_stats_print(struct k_work *item) {
+    LOG_INF("ps2_gpio: int=%u abort=%u(miss=%u start=%u par=%u stop=%u to=%u) "
+            "resend_supp=%u deliv=%u",
+            ps2_gpio_stats.read_ints, ps2_gpio_stats.aborts, ps2_gpio_stats.abort_missed,
+            ps2_gpio_stats.abort_start, ps2_gpio_stats.abort_parity, ps2_gpio_stats.abort_stop,
+            ps2_gpio_stats.abort_timeout, ps2_gpio_stats.resends_suppressed,
+            ps2_gpio_stats.delivered);
+    k_work_schedule(&ps2_gpio_stats_work, K_SECONDS(1));
+}
+
+#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY) */
+
 /*
  * Function Definitions
  */
@@ -417,6 +451,9 @@ void ps2_gpio_send_cmd_resend_worker(struct k_work *item) {
     // inhibit the clock line and time out waiting for a response, corrupting
     // the live stream. Drop the invalid byte and rely on the start-bit
     // alignment / parity / stop-bit checks for resync instead.
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_gpio_stats.resends_suppressed++;
+#endif
     LOG_DBG("Suppressing 0xFE resend write (CONFIG_PS2_GPIO_NO_RESEND)");
 #else
 
@@ -635,11 +672,18 @@ void ps2_gpio_read_interrupt_handler() {
 
     data->last_read_cycle_cnt = cur_read_cycle_cnt;
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_gpio_stats.read_ints++;
+#endif
+
     if (data->cur_read_pos > 0) {
         uint32_t prev_cycle_delta_us =
             k_cyc_to_us_floor32(cur_read_cycle_cnt - last_read_cycle_cnt);
 
         if (prev_cycle_delta_us > PS2_GPIO_TIMING_SCL_CYCLE_MAX) {
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+            ps2_gpio_stats.abort_missed++;
+#endif
             ps2_gpio_read_abort(true, "missed interrupt");
         }
     }
@@ -661,6 +705,9 @@ void ps2_gpio_read_interrupt_handler() {
             // devices send some unintended interrupts. If this is a "real
             // transmission" and we are out of sync, we will catch it with the
             // parity and stop bits and then request a resend.
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+            ps2_gpio_stats.abort_start++;
+#endif
             ps2_gpio_read_abort(false, "invalid start bit");
             return;
         }
@@ -679,6 +726,9 @@ void ps2_gpio_read_interrupt_handler() {
             // If we got to the parity bit and it's incorrect then we
             // are definitly in a transmission and out of sync. So we
             // request a resend.
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+            ps2_gpio_stats.abort_parity++;
+#endif
             ps2_gpio_read_abort(true, "invalid parity bit");
             return;
         }
@@ -689,6 +739,9 @@ void ps2_gpio_read_interrupt_handler() {
             // If we got to the stop bit and it's incorrect then we
             // are definitly in a transmission and out of sync. So we
             // request a resend.
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+            ps2_gpio_stats.abort_stop++;
+#endif
             ps2_gpio_read_abort(true, "invalid stop bit");
             return;
         }
@@ -722,6 +775,10 @@ void ps2_gpio_read_scl_timeout(struct k_work *item) {
 
     LOG_PS2_INT("Read SCL timeout", NULL);
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_gpio_stats.abort_timeout++;
+#endif
+
     // We don't request a resend if the timeout happens in the early
     // stage of the transmission.
     //
@@ -739,6 +796,10 @@ void ps2_gpio_read_scl_timeout(struct k_work *item) {
 
 void ps2_gpio_read_abort(bool should_resend, char *reason) {
     struct ps2_gpio_data *data = &ps2_gpio_data;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_gpio_stats.aborts++;
+#endif
 
     if (should_resend == true) {
         LOG_ERR("Aborting read with resend request on pos=%d: %s", data->cur_read_pos, reason);
@@ -768,6 +829,10 @@ void ps2_gpio_read_abort(bool should_resend, char *reason) {
 
 void ps2_gpio_read_process_received_byte(uint8_t byte) {
     struct ps2_gpio_data *data = &ps2_gpio_data;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_gpio_stats.delivered++;
+#endif
 
     LOG_DBG("Successfully received value: 0x%x", byte);
     LOG_PS2_INT("Successfully received value: ", &byte);
@@ -1396,6 +1461,11 @@ static int ps2_gpio_init(const struct device *dev) {
 
     k_work_init(&data->callback_work, ps2_gpio_read_callback_work_handler);
     k_work_init(&data->resend_cmd_work, ps2_gpio_send_cmd_resend_worker);
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    k_work_init_delayable(&ps2_gpio_stats_work, ps2_gpio_stats_print);
+    k_work_schedule(&ps2_gpio_stats_work, K_SECONDS(1));
+#endif
 
     return 0;
 }

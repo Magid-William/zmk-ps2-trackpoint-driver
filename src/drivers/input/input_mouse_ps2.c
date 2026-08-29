@@ -155,6 +155,31 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
  * Global Variables
  */
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+
+/*
+ * Packet-assembly telemetry: a 1s counter line (LOG_INF) that shows where the
+ * decoder is losing bytes. Off by default.
+ */
+struct ps2_mouse_stats {
+    uint32_t bytes;         /* bytes received via the ps2 callback */
+    uint32_t packets;       /* complete packets parsed */
+    uint32_t align_aborts;  /* bit-3 alignment drops */
+    uint32_t buf_timeouts;  /* packet-buffer timeout resets */
+};
+
+static struct ps2_mouse_stats ps2_mouse_stats;
+
+static struct k_work_delayable ps2_mouse_stats_work;
+
+static void ps2_mouse_stats_print(struct k_work *item) {
+    LOG_INF("ps2_mouse: bytes=%u pkts=%u align_abort=%u buf_to=%u", ps2_mouse_stats.bytes,
+            ps2_mouse_stats.packets, ps2_mouse_stats.align_aborts, ps2_mouse_stats.buf_timeouts);
+    k_work_schedule(&ps2_mouse_stats_work, K_SECONDS(1));
+}
+
+#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY) */
+
 #define MOUSE_PS2_SETTINGS_SUBTREE "mouse_ps2"
 
 typedef enum {
@@ -303,6 +328,10 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
                                      const struct device *ps2_device, uint8_t byte) {
     struct zmk_mouse_ps2_data *data = dev->data;
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.bytes++;
+#endif
+
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
     // LOG_DBG("Received mouse movement data: 0x%x", byte);
@@ -343,6 +372,10 @@ void zmk_mouse_ps2_activity_abort_cmd(const struct device *dev, char *reason) {
     struct zmk_mouse_ps2_data *data = dev->data;
     const struct zmk_mouse_ps2_config *config = dev->config;
     const struct device *ps2_device = config->ps2_device;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.align_aborts++;
+#endif
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
     // Command-rejecting devices (which stream on power-up) never ACK a resend
@@ -392,6 +425,10 @@ void zmk_mouse_ps2_activity_packet_timout(struct k_work *item) {
 
     LOG_DBG("Mouse movement cmd timed out on idx=%d", data->packet_idx);
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.buf_timeouts++;
+#endif
+
     // Reset the cmd buffer in case we are out of alignment.
     // This way if the mouse ever gets out of alignment, the user
     // can reset it by just not moving it for a second.
@@ -410,6 +447,11 @@ void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
                                         uint8_t packet_x, uint8_t packet_y, uint8_t packet_extra) {
     struct zmk_mouse_ps2_data *data = dev->data;
     struct zmk_mouse_ps2_packet packet;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.packets++;
+#endif
+
     packet = zmk_mouse_ps2_activity_parse_packet_buffer(packet_mode, packet_state, packet_x,
                                                         packet_y, packet_extra);
 
@@ -1868,6 +1910,11 @@ static int zmk_mouse_ps2_init(const struct device *dev) {
                     MOUSE_PS2_THREAD_STACK_SIZE, (k_thread_entry_t)zmk_mouse_ps2_init_thread,
                     (struct device *)dev, 0, NULL, K_PRIO_COOP(MOUSE_PS2_THREAD_PRIORITY), 0,
                     K_MSEC(ZMK_MOUSE_PS2_INIT_THREAD_DELAY_MS));
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    k_work_init_delayable(&ps2_mouse_stats_work, ps2_mouse_stats_print);
+    k_work_schedule(&ps2_mouse_stats_work, K_SECONDS(1));
+#endif
 
     return 0;
 }
