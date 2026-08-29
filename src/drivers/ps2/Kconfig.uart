@@ -23,6 +23,15 @@ config PS2_UART_ENABLE_PS2_RESEND_CALLBACK
 	default n
 	select ZMK_INPUT_MOUSE_PS2_ENABLE_PS2_RESEND_CALLBACK
 
+config PS2_UART_INTERNAL_PULLUP
+	bool "Enable internal pull-up on the PS/2 CLK line while reading"
+	default n
+	help
+	  PS/2 CLK is open-drain: the device can only pull it low, so the high
+	  level must come from a pull-up. Directly-wired trackpoints without
+	  external pull-ups need this. When enabled the CLK line is reconfigured
+	  to input with the internal pull-up at the start of every read.
+
 # PM_DEVICE is needed, because we use GPIO bitbanging for writing. And to
 # release the data PIN that is used by the UART device, we use pinctrl to
 # switch to the sleep state. But the sleep state is only included if PM_DEVICE
