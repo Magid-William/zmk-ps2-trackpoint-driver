@@ -678,7 +678,13 @@ void ps2_gpio_read_interrupt_handler() {
     }
 
     data->cur_read_pos += 1;
-    k_work_schedule(&data->read_scl_timout, PS2_GPIO_TIMEOUT_READ_SCL);
+    // The read watchdog deadline is on the order of 100us, so it must run on
+    // the driver's own work queue. The shared system workqueue can be delayed
+    // by any system load (input processing, HID, BLE, shell), firing the
+    // watchdog late and causing spurious mid-byte read aborts. Writes already
+    // use k_work_schedule_for_queue for the same reason.
+    k_work_schedule_for_queue(&ps2_gpio_work_queue, &data->read_scl_timout,
+                              PS2_GPIO_TIMEOUT_READ_SCL);
 }
 
 void ps2_gpio_read_scl_timeout(struct k_work *item) {
