@@ -982,19 +982,21 @@ int zmk_mouse_ps2_activity_reporting_enable(const struct device *dev) {
         return 0;
     }
 
+    int err = 0;
+
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
     // Command-rejecting devices stream on power-up; writing the
     // enable-reporting command would be rejected. Just enable the callback.
 #else
     uint8_t cmd = MOUSE_PS2_CMD_ENABLE_REPORTING[0];
-    int err = ps2_write(ps2_device, cmd);
+    err = ps2_write(ps2_device, cmd);
     if (err) {
         LOG_ERR("Could not enable data reporting: %d", err);
         return err;
     }
 #endif
 
-    int err = ps2_enable_callback(ps2_device);
+    err = ps2_enable_callback(ps2_device);
     if (err) {
         LOG_ERR("Could not enable ps2 callback: %d", err);
         return err;
@@ -1014,18 +1016,20 @@ int zmk_mouse_ps2_activity_reporting_disable(const struct device *dev) {
         return 0;
     }
 
+    int err = 0;
+
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
     // Never write disable-reporting (it would be rejected anyway).
 #else
     uint8_t cmd = MOUSE_PS2_CMD_DISABLE_REPORTING[0];
-    int err = ps2_write(ps2_device, cmd);
+    err = ps2_write(ps2_device, cmd);
     if (err) {
         LOG_ERR("Could not disable data reporting: %d", err);
         return err;
     }
 #endif
 
-    int err = ps2_disable_callback(ps2_device);
+    err = ps2_disable_callback(ps2_device);
     if (err) {
         LOG_ERR("Could not disable ps2 callback: %d", err);
         return err;
@@ -2264,11 +2268,11 @@ DT_INST_FOREACH_STATUS_OKAY(PS2_MOUSE_CALLBACK_DEFINE)
         .tp_x_invert = DT_INST_PROP_OR(n, tp_x_invert, false),                                \
         .tp_y_invert = DT_INST_PROP_OR(n, tp_y_invert, false),                                \
         .tp_xy_swap = DT_INST_PROP_OR(n, tp_xy_swap, false),                                  \
-        .curve_enabled = DT_INST_PROP_OR(n, curve_rate, 0) != 0,                          \
-        .curve_sens = DT_INST_PROP_OR(n, curve_sens, 255),                                \
-        .curve_rate = DT_INST_PROP_OR(n, curve_rate, 0),                                  \
-        .curve_exponent = DT_INST_PROP_OR(n, curve_exponent, 256),                        \
-        .curve_start = DT_INST_PROP_OR(n, curve_start, 256),                              \
+        .curve_enabled = DT_INST_PROP_OR(n, curve_rate, 0) != 0,                              \
+        .curve_sens = DT_INST_PROP_OR(n, curve_sens, 255),                                    \
+        .curve_rate = DT_INST_PROP_OR(n, curve_rate, 0),                                      \
+        .curve_exponent = DT_INST_PROP_OR(n, curve_exponent, 256),                            \
+        .curve_start = DT_INST_PROP_OR(n, curve_start, 256),                                  \
     };                                                                                        \
     DEVICE_DT_INST_DEFINE(n, &zmk_mouse_ps2_init, NULL, &data##n, &config##n,                 \
                         POST_KERNEL, ZMK_MOUSE_PS2_INIT_PRIORITY, NULL);
