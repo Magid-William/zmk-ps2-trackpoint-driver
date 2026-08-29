@@ -498,11 +498,12 @@ void zmk_mouse_ps2_activity_move_mouse(const struct device *dev, int16_t mov_x, 
         last_rpt_time = now;
         if (have_x) {
             ret = input_report_rel(data->dev, INPUT_REL_X, adx, !have_y, K_NO_WAIT);
+            adx = 0;
         }
         if (have_y) {
             ret = input_report_rel(data->dev, INPUT_REL_Y, ady, true, K_NO_WAIT);
+            ady = 0;
         }
-        adx = ady = 0;
     }
 
 #else /* CONFIG_ZMK_INPUT_MOUSE_PS2_REPORT_INTERVAL_MIN > 0 */
