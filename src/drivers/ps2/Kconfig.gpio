@@ -16,6 +16,26 @@ config PS2_GPIO_ENABLE_PS2_RESEND_CALLBACK
 	default n
 	select ZMK_INPUT_MOUSE_PS2_ENABLE_PS2_RESEND_CALLBACK
 
+config PS2_GPIO_TIMING_SCL_CYCLE_MAX
+	int "Maximum allowed time between PS/2 clock pulses during a byte"
+	default 100
+	range 60 10000
+	help
+	  PS/2 clock pulses normally arrive every 60-100 us and the decoder aborts
+	  a byte if a pulse takes longer than this. Some trackpoints with cheap RC
+	  oscillators legitimately pause mid-byte for up to several ms; raise this
+	  (e.g. to 8000) for such devices. The read/write byte timeouts derive
+	  from this value.
+
+config PS2_GPIO_INTERNAL_PULLUP
+	bool "Enable internal pull-ups on the PS/2 CLK and DAT lines"
+	default n
+	help
+	  PS/2 lines are open-drain: the device can only pull them low, so the
+	  high level must come from a pull-up. Directly-wired trackpoints often
+	  have no external pull-ups; enable this to use the MCU's internal
+	  pull-ups on both lines instead.
+
 config PS2_GPIO_WORK_QUEUE_CB_STACK_SIZE
 	int "Stack size of the PS/2 callback work queue thread"
 	default 1024

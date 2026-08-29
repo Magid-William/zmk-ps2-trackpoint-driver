@@ -63,7 +63,7 @@ LOG_MODULE_REGISTER(ps2_gpio);
 // PS2 uses a frequency between 10 kHz and 16.7 kHz. So clocks should arrive
 // within 60-100us.
 #define PS2_GPIO_TIMING_SCL_CYCLE_MIN 60
-#define PS2_GPIO_TIMING_SCL_CYCLE_MAX 100
+#define PS2_GPIO_TIMING_SCL_CYCLE_MAX CONFIG_PS2_GPIO_TIMING_SCL_CYCLE_MAX
 
 // The minimum time needed to inhibit clock to start a write
 // is 100us, but we triple it just in case.
@@ -313,7 +313,15 @@ int ps2_gpio_configure_pin_scl(gpio_flags_t flags, char *descr) {
     return err;
 }
 
-int ps2_gpio_configure_pin_scl_input() { return ps2_gpio_configure_pin_scl((GPIO_INPUT), "input"); }
+int ps2_gpio_configure_pin_scl_input() {
+#if IS_ENABLED(CONFIG_PS2_GPIO_INTERNAL_PULLUP)
+    // PS/2 CLK is open-drain; keep it pulled high when there is no external
+    // pull-up (directly-wired trackpoints).
+    return ps2_gpio_configure_pin_scl((GPIO_INPUT | GPIO_PULL_UP), "input");
+#else
+    return ps2_gpio_configure_pin_scl((GPIO_INPUT), "input");
+#endif
+}
 
 int ps2_gpio_configure_pin_scl_output() {
     return ps2_gpio_configure_pin_scl((GPIO_OUTPUT_HIGH), "output");
@@ -331,7 +339,15 @@ int ps2_gpio_configure_pin_sda(gpio_flags_t flags, char *descr) {
     return err;
 }
 
-int ps2_gpio_configure_pin_sda_input() { return ps2_gpio_configure_pin_sda((GPIO_INPUT), "input"); }
+int ps2_gpio_configure_pin_sda_input() {
+#if IS_ENABLED(CONFIG_PS2_GPIO_INTERNAL_PULLUP)
+    // PS/2 DAT is open-drain; keep it pulled high when there is no external
+    // pull-up (directly-wired trackpoints).
+    return ps2_gpio_configure_pin_sda((GPIO_INPUT | GPIO_PULL_UP), "input");
+#else
+    return ps2_gpio_configure_pin_sda((GPIO_INPUT), "input");
+#endif
+}
 
 int ps2_gpio_configure_pin_sda_output() {
     return ps2_gpio_configure_pin_sda((GPIO_OUTPUT_HIGH), "output");
