@@ -38,6 +38,10 @@ If you are interested in how this project came to be, [check out the development
     - [3.4.2. Which pins to use](#342-which-pins-to-use)
     - [3.4.3. TrackPoint Power-On-Reset](#343-trackpoint-power-on-reset)
     - [3.4.4. Configure other settings](#344-configure-other-settings)
+      - [3.4.4.1. Direct-wired trackpoints that reject host commands](#3441-direct-wired-trackpoints-that-reject-host-commands)
+      - [3.4.4.2. On-device Power curve](#3442-on-device-power-curve)
+      - [3.4.4.3. Speed divisor and anti-glitch filters](#3443-speed-divisor-and-anti-glitch-filters)
+      - [3.4.4.4. Decode telemetry](#3444-decode-telemetry)
     - [3.4.5. Add the PS/2 driver module to your `config/west.yml`](#345-add-the-ps2-driver-module-to-your-configwestyml)
   - [3.5. Switch to a zmk fork with mouse support](#35-switch-to-a-zmk-fork-with-mouse-support)
   - [3.6. Build your firmware using GitHub Actions](#36-build-your-firmware-using-github-actions)
@@ -445,6 +449,102 @@ In `mouse_tp.dtsi`, you will find settings such as TP sensitivity, swapping of a
 You won't need to adjust most of the settings in `your_keyboard.conf`, but one option that's worth mentioning is `CONFIG_ZMK_INPUT_MOUSE_PS2_ENABLE_UROB_COMPAT`.
 
 It is necessary if you want to use [urob's popular zmk fork](https://github.com/urob/zmk).
+
+##### 3.4.4.1. Direct-wired trackpoints that reject host commands
+
+Some generic TrackPoint/PS/2 modules stream 3-byte packets immediately on
+power-up and reject every host command: they never ACK a reset, don't answer
+the identification commands, and writes like `0xF4` (enable reporting) are
+ignored or even inhibit the clock and corrupt the live stream. Their clock
+often comes from a cheap RC oscillator that jitters, which the UART-trick
+(3.4.1) cannot decode reliably.
+
+For such devices, enable the no-commands mode and use the GPIO backend,
+which samples DAT on the real CLK falling edges and is immune to clock
+jitter:
+
+```ini
+CONFIG_PS2=y
+CONFIG_PS2_UART=n
+CONFIG_PS2_GPIO=y
+CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS=y
+# PS/2 lines are open-drain; direct wiring has no external pull-ups
+CONFIG_PS2_GPIO_INTERNAL_PULLUP=y
+# This TP's clock pauses mid-byte for several ms; tolerate it
+CONFIG_PS2_GPIO_TIMING_SCL_CYCLE_MAX=8000
+# NO_RESEND defaults on with NO_HOST_COMMANDS; only needed for split/dongle
+# topologies, raise the callback work-queue stack:
+CONFIG_PS2_GPIO_WORK_QUEUE_CB_STACK_SIZE=4096
+```
+
+In no-commands mode:
+
+- The handshake (self-test, reset, identification, configuration) is skipped;
+  the driver waits 1.5 s for the device to power up and start streaming, then
+  enables the data callback.
+- X/Y are decoded as two's-complement `int8` instead of trusting the status
+  byte's sign bits, which decode unreliably on these devices.
+- The driver never initiates a write to the device (the GPIO backend's
+  internal `0xFE` resend is suppressed as well).
+- The device-tree tuning props (`tp-sensitivity`, `sampling-rate`,
+  `scroll-mode`, etc.) are no-ops because the device rejects the commands
+  they would send. Clicks are still decoded and can be disabled with
+  `disable-clicking`.
+
+##### 3.4.4.2. On-device Power curve
+
+The driver can apply a RawAccel-style "Power" velocity curve on the host
+instead of relying on the OS. Enable it in `your_keyboard.conf`:
+
+```ini
+CONFIG_ZMK_INPUT_MOUSE_PS2_POWER_CURVE=y
+```
+
+Then set these properties on the `zmk,input-mouse-ps2` node:
+
+```dts
+&tpoint0 {
+    curve-sens = <128>;        /* Q8.8 sensitivity, 255 = 1.0 (loudness) */
+    curve-rate = <18>;         /* Q8.8 rate — non-zero ENABLES the curve */
+    curve-exponent = <256>;    /* Q8.8 power exponent, 256 = 1.0         */
+    curve-start = <77>;        /* Q8.8 output offset, 256 = 1.0 (precision) */
+};
+```
+
+- The transfer function is `f(v) = start + (rate * v)^exponent` with
+  `v = |(x,y)|` per input packet, applied to the whole vector with
+  fractional-remainder accumulation and an int8 clamp.
+- `curve-rate = 0` (default) leaves the curve disabled and the raw stream
+  untouched — the safe identity default.
+- The curve runs in the input driver before the speed-divisor/report stage,
+  so it applies in every topology (split central, standalone central, dongle).
+- Enabling the curve compiles `power_curve.c`, which calls float `pow()` at
+  init. When using the curve, `CONFIG_PICOLIBC=n` + `CONFIG_NEWLIB_LIBC=y`
+  is known to work.
+
+##### 3.4.4.3. Speed divisor and anti-glitch filters
+
+These opt-in options shape the movement stream before it is reported:
+
+- `CONFIG_ZMK_INPUT_MOUSE_PS2_SPEED_DIVISOR` (int, default `1`): divide all
+  movement reports by this value with remainder accumulation, so slow motion
+  is batched instead of dropped (e.g. `100` = 1% speed).
+- `CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW` (int, default `1`): per-axis
+  median-3 or median-5 filter that kills decode spike bursts.
+- `CONFIG_ZMK_INPUT_MOUSE_PS2_SLEW_MAX` (int, default `0`): reject a lone
+  delta above this magnitude (a sustained fast flick is kept).
+- `CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N` (int, default `1`): EMA
+  low-pass on the movement deltas.
+
+All defaults keep the raw stream, so these are off unless you set them.
+
+##### 3.4.4.4. Decode telemetry
+
+`CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY` (bool, default `n`) prints one
+counter line per second from the input driver (bytes, packets, alignment
+aborts, buffer timeouts) and from the gpio backend (decode aborts by cause,
+delivered bytes). Useful for diagnosing transmission problems without a
+per-packet trace.
 
 <a name="zmk-module"></a>
 
@@ -958,6 +1058,12 @@ But if it is working, even just a little bit, you can be sure that at least you 
 You can then try to change the UART baud rate in [zmk-config/boards/shields/your_keyboard/your_keyboard_right.overlay](https://github.com/infused-kim/kb_zmk_ps2_mouse_trackpoint_driver-zmk_config/blob/main/boards/shields/corne_tp/corne_tp_right.overlay#L120) to `19200` or `9600`.
 
 If those are not working, then, unfortunately, the device is not compatible with the UART driver.
+
+If you are wiring a module directly to the controller and the device also
+rejects host commands, see [3.4.4.1. Direct-wired trackpoints that reject
+host commands](#3441-direct-wired-trackpoints-that-reject-host-commands) for
+the no-commands mode and the clock-tolerance settings that tamed a jittery
+RC clock.
 
 You could try debugging it further with a logic analyzer or you can buy one of the known to be compatible devices.
 
