@@ -1192,9 +1192,16 @@ int ps2_uart_read(const struct device *dev, uint8_t *value) {
 }
 
 static int ps2_uart_write(const struct device *dev, uint8_t value) {
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // No-commands mode: never initiate a host-to-device transmission.
+    // (The connected device rejects all host commands anyway.)
+    LOG_WRN("No-commands mode: refusing to send byte 0x%x", value);
+    return -ENOTSUP;
+#else
     int ret = ps2_uart_write_byte(dev, value);
 
     return ret;
+#endif
 }
 
 static int ps2_uart_disable_callback(const struct device *dev) {

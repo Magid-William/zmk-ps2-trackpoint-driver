@@ -27,6 +27,11 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 // Delay mouse init to give the mouse time to send the init sequence.
 #define ZMK_MOUSE_PS2_INIT_THREAD_DELAY_MS 1000
 
+// In no-commands mode, how long to wait for the device to power up and
+// start streaming before enabling the data callback.
+// (TrackPoint POR = 600 ms ± 20 %; a little margin on top.)
+#define ZMK_MOUSE_PS2_NO_COMMANDS_INIT_DELAY_MS 1500
+
 // How often the driver try to initialize a mouse before we give up.
 #define MOUSE_PS2_INIT_ATTEMPTS 10
 
@@ -314,12 +319,22 @@ void zmk_mouse_ps2_activity_abort_cmd(const struct device *dev, char *reason) {
     const struct zmk_mouse_ps2_config *config = dev->config;
     const struct device *ps2_device = config->ps2_device;
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // Command-rejecting devices (which stream on power-up) never ACK a resend
+    // request; writing 0xFE would inhibit the clock line and corrupt the live
+    // stream. Drop the partial packet and resync on the next valid start bit.
+    LOG_ERR("PS/2 Mouse cmd buffer is out of alignment. Dropping partial packet: %s", reason);
+
+    data->packet_idx = 0;
+    zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+#else
     LOG_ERR("PS/2 Mouse cmd buffer is out of aligment. Requesting resend: %s", reason);
 
     data->packet_idx = 0;
     ps2_write(ps2_device, MOUSE_PS2_CMD_RESEND[0]);
 
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+#endif
 }
 
 // Called if the PS/2 driver encounters a transmission error and asks the
@@ -427,6 +442,15 @@ zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode
     packet.overflow_y = MOUSE_PS2_GET_BIT(packet_state, 7);
     packet.scroll = 0;
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // Some command-rejecting trackpoints send a status byte that decodes
+    // unreliably while the X/Y data bytes come out clean. Don't trust its
+    // sign bits - decode the raw data bytes as two's-complement int8
+    // instead. Deltas fit in +/-127, so 0xC4 -> -60, 0xFF -> -1.
+    packet.mov_x = (int8_t)packet_x;
+    packet.mov_y = (int8_t)packet_y;
+#else
+
     // The coordinates are delivered as a signed 9bit integers.
     // But a PS/2 packet is only 8 bits, so the most significant
     // bit with the sign is stored inside the state packet.
@@ -449,6 +473,7 @@ zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode
     // https://wiki.osdev.org/PS/2_Mouse
     packet.mov_x = packet_x - ((packet_state << 4) & 0x100);
     packet.mov_y = packet_y - ((packet_state << 3) & 0x100);
+#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS) */
 
     // If packet mode scroll or scroll+5 buttons is used,
     // then the first 4 bit of the extra byte are used for the
@@ -753,14 +778,19 @@ int zmk_mouse_ps2_activity_reporting_enable(const struct device *dev) {
         return 0;
     }
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // Command-rejecting devices stream on power-up; writing the
+    // enable-reporting command would be rejected. Just enable the callback.
+#else
     uint8_t cmd = MOUSE_PS2_CMD_ENABLE_REPORTING[0];
     int err = ps2_write(ps2_device, cmd);
     if (err) {
         LOG_ERR("Could not enable data reporting: %d", err);
         return err;
     }
+#endif
 
-    err = ps2_enable_callback(ps2_device);
+    int err = ps2_enable_callback(ps2_device);
     if (err) {
         LOG_ERR("Could not enable ps2 callback: %d", err);
         return err;
@@ -780,14 +810,18 @@ int zmk_mouse_ps2_activity_reporting_disable(const struct device *dev) {
         return 0;
     }
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // Never write disable-reporting (it would be rejected anyway).
+#else
     uint8_t cmd = MOUSE_PS2_CMD_DISABLE_REPORTING[0];
     int err = ps2_write(ps2_device, cmd);
     if (err) {
         LOG_ERR("Could not disable data reporting: %d", err);
         return err;
     }
+#endif
 
-    err = ps2_disable_callback(ps2_device);
+    int err = ps2_disable_callback(ps2_device);
     if (err) {
         LOG_ERR("Could not disable ps2 callback: %d", err);
         return err;
@@ -1716,6 +1750,15 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
 
     zmk_mouse_ps2_init_power_on_reset(dev);
 
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // No-commands mode: the device streams data on power-up and rejects all
+    // host commands, so there is no self-test to wait for, no reset to send
+    // and no configuration to apply. Wait past the device's power-on reset
+    // (600 ms ± 20 %), then just enable the data callback.
+    LOG_INF("No-commands mode: waiting %d ms for the device to start streaming...",
+            ZMK_MOUSE_PS2_NO_COMMANDS_INIT_DELAY_MS);
+    k_sleep(K_MSEC(ZMK_MOUSE_PS2_NO_COMMANDS_INIT_DELAY_MS));
+#else
     LOG_INF("Waiting for mouse to connect...");
     err = zmk_mouse_ps2_init_wait_for_mouse(dev);
     if (err) {
@@ -1790,6 +1833,7 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         LOG_INF("Enabling scroll mode.");
         zmk_mouse_ps2_set_packet_mode(dev, MOUSE_PS2_PACKET_MODE_SCROLL);
     }
+#endif /* IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS) */
 
     zmk_mouse_ps2_settings_init(dev);
 

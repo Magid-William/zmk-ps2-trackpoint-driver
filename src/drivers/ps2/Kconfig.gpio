@@ -16,6 +16,16 @@ config PS2_GPIO_ENABLE_PS2_RESEND_CALLBACK
 	default n
 	select ZMK_INPUT_MOUSE_PS2_ENABLE_PS2_RESEND_CALLBACK
 
+config PS2_GPIO_NO_RESEND
+	bool "Suppress 0xFE resend writes entirely"
+	default y if ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS
+	help
+	  Devices that reject all host commands (certain generic trackpoints)
+	  will never ACK a 0xFE resend: each attempt inhibits the clock line and
+	  times out waiting for a response, corrupting an ongoing stream. When
+	  enabled the backend drops invalid bytes instead of writing anything,
+	  relying on the align-on-bit-3 / parity / stop-bit checks for resync.
+
 config PS2_GPIO_TIMING_SCL_CYCLE_MAX
 	int "Maximum allowed time between PS/2 clock pulses during a byte"
 	default 100

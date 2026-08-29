@@ -412,6 +412,14 @@ void ps2_gpio_data_queue_add(uint8_t byte) {
 
 void ps2_gpio_send_cmd_resend_worker(struct k_work *item) {
 
+#if IS_ENABLED(CONFIG_PS2_GPIO_NO_RESEND)
+    // Command-rejecting trackpoints never ACK a 0xFE resend; writing it would
+    // inhibit the clock line and time out waiting for a response, corrupting
+    // the live stream. Drop the invalid byte and rely on the start-bit
+    // alignment / parity / stop-bit checks for resync instead.
+    LOG_DBG("Suppressing 0xFE resend write (CONFIG_PS2_GPIO_NO_RESEND)");
+#else
+
 #if IS_ENABLED(CONFIG_PS2_GPIO_ENABLE_PS2_RESEND_CALLBACK)
 
     struct ps2_gpio_data *data = &ps2_gpio_data;
@@ -429,6 +437,7 @@ void ps2_gpio_send_cmd_resend_worker(struct k_work *item) {
     uint8_t cmd = 0xfe;
     // LOG_DBG("Requesting resend of data with command: 0x%x", cmd);
     ps2_gpio_write_byte(cmd);
+#endif /* IS_ENABLED(CONFIG_PS2_GPIO_NO_RESEND) */
 }
 
 void ps2_gpio_send_cmd_resend() {

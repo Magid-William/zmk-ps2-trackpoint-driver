@@ -16,6 +16,17 @@ config ZMK_INPUT_MOUSE_PS2_ENABLE_PS2_RESEND_CALLBACK
 
 if ZMK_INPUT_MOUSE_PS2
 
+config ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS
+	bool "Never send any host commands to the PS/2 device"
+	default n
+	help
+	  For PS/2 devices that stream data immediately on power-up and reject
+	  all host commands (e.g. certain generic trackpoints). Skips the
+	  self-test/reset/identification/config handshake, never requests
+	  resends, and never writes the enable/disable-reporting commands.
+	  With this mode the trackpoint tuning props and the &mms behavior are
+	  no-ops.
+
 config ZMK_INPUT_MOUSE_PS2_POWER_ON_RESET_TIME
     int "The POR shall be timed to occur 600 ms ± 20 % from the time power is applied to the TrackPoint controller."
     default 600
