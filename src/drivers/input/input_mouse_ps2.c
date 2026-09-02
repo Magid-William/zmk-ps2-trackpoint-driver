@@ -264,6 +264,13 @@ struct zmk_mouse_ps2_data {
     int16_t last_y;
 #endif
 
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_DELTA_MAX > 0
+    // Exp77: jump-filter state (last ACCEPTED per-axis deltas, replayed on a
+    // rejected jump packet).
+    int16_t jump_last_x;
+    int16_t jump_last_y;
+#endif
+
 #if CONFIG_ZMK_INPUT_MOUSE_PS2_MOVEMENT_EMA_N > 1
     // EMA low-pass state for the movement deltas
     int32_t ema_x;
@@ -623,6 +630,29 @@ void zmk_mouse_ps2_activity_move_mouse(const struct device *dev, int16_t mov_x, 
 
     bool have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
     bool have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+
+#if CONFIG_ZMK_INPUT_MOUSE_PS2_DELTA_MAX > 0
+    // Exp77: single-packet magnitude jump filter. Runs FIRST, before the
+    // median/curve/divisor stages, so a replayed value flows through the
+    // rest of the chain like any normal delta. A spurious packet that slips
+    // past the gpio-ps2 decode checks (parity/stop-bit all pass) carries an
+    // absurd per-packet delta; if |delta| exceeds the threshold we treat it
+    // as a jump and re-emit the last accepted value instead. Idle (last
+    // accepted = 0) replays 0 -> the cursor holds; during motion a jump
+    // replays the previous real delta (small extra move, no leap).
+    if (abs(mov_x) > CONFIG_ZMK_INPUT_MOUSE_PS2_DELTA_MAX) {
+        mov_x = data->jump_last_x;
+    } else {
+        data->jump_last_x = mov_x;
+    }
+    if (abs(mov_y) > CONFIG_ZMK_INPUT_MOUSE_PS2_DELTA_MAX) {
+        mov_y = data->jump_last_y;
+    } else {
+        data->jump_last_y = mov_y;
+    }
+    have_x = zmk_mouse_ps2_is_non_zero_1d_movement(mov_x);
+    have_y = zmk_mouse_ps2_is_non_zero_1d_movement(mov_y);
+#endif
 
 #if CONFIG_ZMK_INPUT_MOUSE_PS2_MEDIAN_WINDOW >= 5
     // The decode glitches come in bursts of 2-3 packets, so a window of 5

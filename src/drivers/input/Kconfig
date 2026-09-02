@@ -86,6 +86,19 @@ config ZMK_INPUT_MOUSE_PS2_SLEW_MAX
 	  previous report also exceeded it, so a sustained fast flick is kept
 	  while a lone spike is treated as a decode glitch.
 
+config ZMK_INPUT_MOUSE_PS2_DELTA_MAX
+	int "Reject single-packet deltas larger than this, replay last accepted (0 = off)"
+	default 0
+	range 0 255
+	help
+	  Exp77: single-packet magnitude jump filter. A spurious packet that
+	  slips past the gpio-ps2 decode checks (parity/stop-bit all pass)
+	  carries an absurd per-packet delta. If |delta| exceeds this threshold,
+	  treat it as a jump and re-emit the last accepted value instead of the
+	  spike, so the cursor holds rather than leaps. 0 = off.
+	  NOTE: this also clips genuine single fast flicks (unlike SLEW_MAX,
+	  which exempts sustained big deltas). Exp77: 100.
+
 config ZMK_INPUT_MOUSE_PS2_TELEMETRY
 	bool "Print 1s decode counters (input driver + ps2-gpio backend)"
 	default n
