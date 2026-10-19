@@ -12,6 +12,9 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/atomic.h>
+
+#include <zmk/ps2_gpio.h>
 
 #define LOG_LEVEL CONFIG_PS2_LOG_LEVEL
 LOG_MODULE_REGISTER(ps2_gpio);
@@ -24,6 +27,12 @@ LOG_MODULE_REGISTER(ps2_gpio);
 #define PS2_GPIO_READ_MAX_RETRY 3
 
 #define PS2_GPIO_DATA_QUEUE_SIZE 100
+
+// Ordered byte/error queue for the PS/2 callback. A single callback_byte slot
+// silently coalesced bytes when the callback work queue was delayed; a lost
+// byte then looked like a clean stream to the input driver. The queue keeps
+// the stream and the error notification in the exact order they happened.
+#define PS2_GPIO_CB_QUEUE_SIZE 32
 
 // Custom queue for background PS/2 processing work at low priority
 // We purposefully want this to be a fairly low priority, because
@@ -145,6 +154,11 @@ struct ps2_gpio_data_queue_item {
     uint8_t byte;
 };
 
+struct ps2_gpio_cb_event {
+    uint8_t byte;
+    uint8_t error;
+};
+
 struct ps2_gpio_config {
     struct gpio_dt_spec scl_gpio;
     struct gpio_dt_spec sda_gpio;
@@ -163,8 +177,13 @@ struct ps2_gpio_data {
 
     // PS2 driver interface callback
     struct k_work callback_work;
-    uint8_t callback_byte;
+    struct k_msgq cb_queue;
+    struct ps2_gpio_cb_event cb_queue_buffer[PS2_GPIO_CB_QUEUE_SIZE];
+    atomic_t cb_overflow;
     ps2_callback_t callback_isr;
+
+    // Module-private read-error callback (see <zmk/ps2_gpio.h>).
+    ps2_gpio_read_error_cb_t read_error_cb;
 
 #if IS_ENABLED(CONFIG_PS2_GPIO_ENABLE_PS2_RESEND_CALLBACK)
     ps2_resend_callback_t resend_callback_isr;
@@ -207,8 +226,8 @@ static const struct ps2_gpio_config ps2_gpio_config = {
 };
 
 static struct ps2_gpio_data ps2_gpio_data = {
-    .callback_byte = 0x0,
     .callback_isr = NULL,
+    .read_error_cb = NULL,
 
 #if IS_ENABLED(CONFIG_PS2_GPIO_ENABLE_PS2_RESEND_CALLBACK)
     .resend_callback_isr = NULL,
@@ -250,7 +269,9 @@ struct ps2_gpio_stats {
     uint32_t abort_stop;         /* invalid stop bit */
     uint32_t abort_timeout;      /* SCL read timeout */
     uint32_t resends_suppressed; /* 0xFE writes suppressed */
+    uint32_t read_errors;        /* aborts with a byte in progress (byte lost) */
     uint32_t delivered;          /* bytes handed to the ps2 callback/queue */
+    uint32_t cb_queue_full;      /* callback queue overflow (resync) */
 };
 
 static struct ps2_gpio_stats ps2_gpio_stats;
@@ -259,11 +280,12 @@ static struct k_work_delayable ps2_gpio_stats_work;
 
 static void ps2_gpio_stats_print(struct k_work *item) {
     LOG_INF("ps2_gpio: int=%u abort=%u(miss=%u start=%u par=%u stop=%u to=%u) "
-            "resend_supp=%u deliv=%u",
+            "err=%u resend_supp=%u deliv=%u cb_lost=%u",
             ps2_gpio_stats.read_ints, ps2_gpio_stats.aborts, ps2_gpio_stats.abort_missed,
             ps2_gpio_stats.abort_start, ps2_gpio_stats.abort_parity, ps2_gpio_stats.abort_stop,
-            ps2_gpio_stats.abort_timeout, ps2_gpio_stats.resends_suppressed,
-            ps2_gpio_stats.delivered);
+            ps2_gpio_stats.abort_timeout, ps2_gpio_stats.read_errors,
+            ps2_gpio_stats.resends_suppressed, ps2_gpio_stats.delivered,
+            ps2_gpio_stats.cb_queue_full);
     k_work_schedule(&ps2_gpio_stats_work, K_SECONDS(1));
 }
 
@@ -442,6 +464,50 @@ void ps2_gpio_data_queue_add(uint8_t byte) {
     if (ret != 0) {
         LOG_ERR("Failed to add byte 0x%x to the data queue.", byte);
     }
+}
+
+static void ps2_gpio_cb_queue_kick(void) {
+    struct ps2_gpio_data *data = &ps2_gpio_data;
+
+    k_work_submit_to_queue(&ps2_gpio_work_queue_cb, &data->callback_work);
+}
+
+static void ps2_gpio_cb_queue_add(uint8_t byte) {
+    struct ps2_gpio_data *data = &ps2_gpio_data;
+    struct ps2_gpio_cb_event event = {.byte = byte, .error = 0};
+
+    if (k_msgq_put(&data->cb_queue, &event, K_NO_WAIT) != 0) {
+        // The consumer is stalled. Drop everything and tell the input driver
+        // to resync: delivering a stream with a hidden hole is worse than a
+        // short cursor hold.
+        atomic_set(&data->cb_overflow, 1);
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+        ps2_gpio_stats.cb_queue_full++;
+#endif
+        LOG_WRN("PS/2 callback queue full; forcing resync");
+    }
+
+    ps2_gpio_cb_queue_kick();
+}
+
+static void ps2_gpio_cb_queue_add_error(void) {
+    struct ps2_gpio_data *data = &ps2_gpio_data;
+    struct ps2_gpio_cb_event event = {.byte = 0, .error = 1};
+
+    if (data->read_error_cb == NULL || data->callback_isr == NULL ||
+        !data->callback_enabled) {
+        return;
+    }
+
+    if (k_msgq_put(&data->cb_queue, &event, K_NO_WAIT) != 0) {
+        atomic_set(&data->cb_overflow, 1);
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+        ps2_gpio_stats.cb_queue_full++;
+#endif
+        LOG_WRN("PS/2 callback queue full on read error; forcing resync");
+    }
+
+    ps2_gpio_cb_queue_kick();
 }
 
 void ps2_gpio_send_cmd_resend_worker(struct k_work *item) {
@@ -685,6 +751,10 @@ void ps2_gpio_read_interrupt_handler() {
             ps2_gpio_stats.abort_missed++;
 #endif
             ps2_gpio_read_abort(true, "missed interrupt");
+            // The current edge belongs to the aborted byte, not to a new
+            // start bit. Waiting for the next edge avoids re-framing the
+            // stream from a random data bit.
+            return;
         }
     }
 
@@ -796,16 +866,28 @@ void ps2_gpio_read_scl_timeout(struct k_work *item) {
 
 void ps2_gpio_read_abort(bool should_resend, char *reason) {
     struct ps2_gpio_data *data = &ps2_gpio_data;
+    bool byte_in_progress = data->cur_read_pos > PS2_GPIO_POS_START;
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
     ps2_gpio_stats.aborts++;
+    if (byte_in_progress) {
+        ps2_gpio_stats.read_errors++;
+    }
 #endif
 
-    if (should_resend == true) {
-        LOG_ERR("Aborting read with resend request on pos=%d: %s", data->cur_read_pos, reason);
-        LOG_PS2_INT("Aborting read with resend request.", NULL);
+    if (byte_in_progress) {
+        // A byte that was already clocking in is lost. Tell the input driver
+        // in stream order, before any later byte is delivered, so it can drop
+        // its partial packet instead of letting the next packet complete it.
+        ps2_gpio_cb_queue_add_error();
+        LOG_WRN("PS/2 read drop: pos=%d reason=%s %s t=%u", data->cur_read_pos, reason,
+                should_resend ? (IS_ENABLED(CONFIG_PS2_GPIO_NO_RESEND) ? "resend-suppressed"
+                                                                      : "resend-requested")
+                              : "no-resend",
+                k_uptime_get_32());
+        LOG_PS2_INT("Aborting read with a byte in progress.", NULL);
     } else {
-        LOG_PS2_INT("Aborting read without resend request.", NULL);
+        LOG_PS2_INT("Aborting read without a byte in progress.", NULL);
     }
 
     ps2_gpio_read_finish();
@@ -863,21 +945,40 @@ void ps2_gpio_read_process_received_byte(uint8_t byte) {
     // that can be read later with the read using `ps2_read`
     if (data->callback_isr != NULL && data->callback_enabled) {
 
-        // Call callback from a worker to make sure the callback
-        // doesn't block the interrupt.
-        // Will call ps2_gpio_read_callback_work_handler
-        data->callback_byte = byte;
-        k_work_submit_to_queue(&ps2_gpio_work_queue_cb, &data->callback_work);
+        // Queue the byte and let the worker call the callback outside the
+        // interrupt. The queue (not a single slot) keeps every byte and every
+        // read-error notification in stream order even if the worker is
+        // delayed.
+        ps2_gpio_cb_queue_add(byte);
     } else {
         ps2_gpio_data_queue_add(byte);
     }
 }
 
 void ps2_gpio_read_callback_work_handler(struct k_work *work) {
-    struct ps2_gpio_data *data = &ps2_gpio_data;
+    struct ps2_gpio_data *data = CONTAINER_OF(work, struct ps2_gpio_data, callback_work);
+    struct ps2_gpio_cb_event event;
 
-    data->callback_isr(data->dev, data->callback_byte);
-    data->callback_byte = 0x0;
+    if (atomic_clear(&data->cb_overflow)) {
+        k_msgq_purge(&data->cb_queue);
+        if (data->read_error_cb != NULL) {
+            data->read_error_cb(data->dev);
+        }
+        return;
+    }
+
+    while (k_msgq_get(&data->cb_queue, &event, K_NO_WAIT) == 0) {
+        if (event.error) {
+            if (data->read_error_cb != NULL) {
+                // The byte that was in flight when the error happened was
+                // never delivered: the input driver must drop its partial
+                // packet and resync.
+                data->read_error_cb(data->dev);
+            }
+        } else if (data->callback_isr != NULL && data->callback_enabled) {
+            data->callback_isr(data->dev, event.byte);
+        }
+    }
 }
 
 void ps2_gpio_read_finish() {
@@ -1345,9 +1446,11 @@ static int ps2_gpio_write(const struct device *dev, uint8_t value) {
 static int ps2_gpio_disable_callback(const struct device *dev) {
     struct ps2_gpio_data *data = dev->data;
 
-    // Make sure there are no stale items in the data queue
+    // Make sure there are no stale items in the data/callback queues
     // from before the callback was disabled.
     ps2_gpio_data_queue_empty();
+    k_msgq_purge(&data->cb_queue);
+    atomic_clear(&data->cb_overflow);
 
     data->callback_enabled = false;
 
@@ -1363,6 +1466,8 @@ static int ps2_gpio_enable_callback(const struct device *dev) {
     // LOG_DBG("Enabled PS2 callback.");
 
     ps2_gpio_data_queue_empty();
+    k_msgq_purge(&data->cb_queue);
+    atomic_clear(&data->cb_overflow);
 
     return 0;
 }
@@ -1414,6 +1519,18 @@ static int ps2_gpio_init_gpio(void) {
     return err;
 }
 
+int ps2_gpio_set_read_error_callback(const struct device *ps2_dev, ps2_gpio_read_error_cb_t cb) {
+    struct ps2_gpio_data *data = &ps2_gpio_data;
+
+    if (ps2_dev != data->dev) {
+        return -ENODEV;
+    }
+
+    data->read_error_cb = cb;
+
+    return 0;
+}
+
 static int ps2_gpio_init(const struct device *dev) {
 
     struct ps2_gpio_data *data = dev->data;
@@ -1432,6 +1549,10 @@ static int ps2_gpio_init(const struct device *dev) {
     // Init data queue for synchronous read operations
     k_msgq_init(&data->data_queue, data->data_queue_buffer, sizeof(struct ps2_gpio_data_queue_item),
                 PS2_GPIO_DATA_QUEUE_SIZE);
+
+    // Init ordered byte/error queue for the PS/2 callback
+    k_msgq_init(&data->cb_queue, (char *)data->cb_queue_buffer, sizeof(struct ps2_gpio_cb_event),
+                PS2_GPIO_CB_QUEUE_SIZE);
 
     // Init semaphore for blocking writes
     k_sem_init(&data->write_lock, 0, 1);

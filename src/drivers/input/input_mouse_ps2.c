@@ -11,12 +11,15 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/kernel.h>
 #include <zephyr/drivers/ps2.h>
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 #include <zephyr/input/input.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/sys/util.h>
+
+#include <zmk/ps2_gpio.h>
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -170,6 +173,9 @@ struct ps2_mouse_stats {
     uint32_t packets;       /* complete packets parsed */
     uint32_t align_aborts;  /* bit-3 alignment drops */
     uint32_t buf_timeouts;  /* packet-buffer timeout resets */
+    uint32_t drops;         /* byte-level read errors reported by ps2_gpio */
+    uint32_t held_bytes;    /* bytes discarded while holding after a drop */
+    uint32_t resync_done;   /* completed drop resyncs */
 };
 
 static struct ps2_mouse_stats ps2_mouse_stats;
@@ -177,8 +183,10 @@ static struct ps2_mouse_stats ps2_mouse_stats;
 static struct k_work_delayable ps2_mouse_stats_work;
 
 static void ps2_mouse_stats_print(struct k_work *item) {
-    LOG_INF("ps2_mouse: bytes=%u pkts=%u align_abort=%u buf_to=%u", ps2_mouse_stats.bytes,
-            ps2_mouse_stats.packets, ps2_mouse_stats.align_aborts, ps2_mouse_stats.buf_timeouts);
+    LOG_INF("ps2_mouse: bytes=%u pkts=%u align_abort=%u buf_to=%u drops=%u held=%u resync=%u",
+            ps2_mouse_stats.bytes, ps2_mouse_stats.packets, ps2_mouse_stats.align_aborts,
+            ps2_mouse_stats.buf_timeouts, ps2_mouse_stats.drops, ps2_mouse_stats.held_bytes,
+            ps2_mouse_stats.resync_done);
     k_work_schedule(&ps2_mouse_stats_work, K_SECONDS(1));
 }
 
@@ -220,6 +228,16 @@ struct zmk_mouse_ps2_config {
     uint16_t curve_start;
 };
 
+// Exp80: after a lost PS/2 byte the 3-byte packet stream is out of phase.
+// ALIGNED = normal. SCAN = look for a status-byte candidate. CONFIRM =
+// assemble a candidate packet and require the next packet start to be another
+// candidate; movement is suppressed until three starts 3 bytes apart agree.
+enum zmk_mouse_ps2_resync_state {
+    MOUSE_PS2_RESYNC_ALIGNED = 0,
+    MOUSE_PS2_RESYNC_SCAN,
+    MOUSE_PS2_RESYNC_CONFIRM,
+};
+
 struct zmk_mouse_ps2_packet {
     int16_t mov_x;
     int16_t mov_y;
@@ -243,6 +261,15 @@ struct zmk_mouse_ps2_data {
     int packet_idx;
     struct zmk_mouse_ps2_packet prev_packet;
     struct k_work_delayable packet_buffer_timeout;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_HOLD_ON_DROP)
+    // Exp80: byte-drop hold/resync state.
+    uint8_t resync_state;
+    uint8_t resync_confirm;
+    uint16_t resync_bytes;
+    bool resync_relaxed;
+#endif
+
 #if IS_ENABLED(CONFIG_SETTINGS)
     struct k_work_delayable zmk_mouse_ps2_save_work;
 #endif
@@ -302,6 +329,7 @@ struct zmk_mouse_ps2_data {
 
     void *activity_callback;
     void *activity_resend_callback;
+    ps2_gpio_read_error_cb_t activity_read_error_callback;
 };
 
 // declare datas and configs for all devices
@@ -336,6 +364,9 @@ void zmk_mouse_ps2_activity_process_cmd(const struct device *dev,
                                         zmk_mouse_ps2_packet_mode packet_mode, uint8_t packet_state,
                                         uint8_t packet_x, uint8_t packet_y, uint8_t packet_extra);
 void zmk_mouse_ps2_activity_abort_cmd(const struct device *dev, char *reason);
+void zmk_mouse_ps2_activity_read_error_callback(const struct device *dev,
+                                                const struct device *ps2_device);
+void zmk_mouse_ps2_resync_enter(const struct device *dev);
 void zmk_mouse_ps2_activity_move_mouse(const struct device *dev, int16_t mov_x, int16_t mov_y);
 void zmk_mouse_ps2_activity_scroll(const struct device *dev, int8_t scroll_y);
 void zmk_mouse_ps2_activity_click_buttons(const struct device *dev, 
@@ -346,6 +377,133 @@ struct zmk_mouse_ps2_packet
 zmk_mouse_ps2_activity_parse_packet_buffer(zmk_mouse_ps2_packet_mode packet_mode,
                                            uint8_t packet_state, uint8_t packet_x, uint8_t packet_y,
                                            uint8_t packet_extra);
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_HOLD_ON_DROP)
+
+// After this many bytes without a confirmed boundary, stop requiring the
+// status byte's overflow bits to be zero. They should always be zero for this
+// class of trackpoint (8-bit deltas), but never lock the stream out if the
+// device disagrees.
+#define MOUSE_PS2_RESYNC_RELAX_BYTES 30
+
+static bool zmk_mouse_ps2_status_candidate(uint8_t byte, bool relaxed) {
+    // Bit 3 of the first packet byte is always 1.
+    if ((byte & BIT(3)) == 0) {
+        return false;
+    }
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS)
+    // This driver decodes X/Y as int8, so the 9-bit overflow flags are never
+    // set on a real status byte here. Requiring them to be 0 makes it 8x less
+    // likely to lock onto a random data byte.
+    if (!relaxed && (byte & (BIT(6) | BIT(7))) != 0) {
+        return false;
+    }
+#endif
+
+    return true;
+}
+
+void zmk_mouse_ps2_resync_enter(const struct device *dev) {
+    struct zmk_mouse_ps2_data *data = dev->data;
+
+    data->resync_state = MOUSE_PS2_RESYNC_SCAN;
+    data->resync_confirm = 0;
+    data->resync_bytes = 0;
+    data->resync_relaxed = false;
+    data->packet_idx = 0;
+    memset(data->packet_buffer, 0x0, sizeof(data->packet_buffer));
+}
+
+static void zmk_mouse_ps2_resync_byte(const struct device *dev, uint8_t byte) {
+    struct zmk_mouse_ps2_data *data = dev->data;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.held_bytes++;
+#endif
+
+    if (data->resync_bytes < UINT16_MAX) {
+        data->resync_bytes++;
+    }
+    if (!data->resync_relaxed && data->resync_bytes > MOUSE_PS2_RESYNC_RELAX_BYTES) {
+        data->resync_relaxed = true;
+        LOG_WRN("PS/2 resync: relaxing status-byte check after %u bytes",
+                data->resync_bytes);
+    }
+
+    if (data->resync_state == MOUSE_PS2_RESYNC_SCAN) {
+        if (!zmk_mouse_ps2_status_candidate(byte, data->resync_relaxed)) {
+            return;
+        }
+
+        data->packet_buffer[0] = byte;
+        data->packet_idx = 1;
+        data->resync_state = MOUSE_PS2_RESYNC_CONFIRM;
+        data->resync_confirm = 0;
+        return;
+    }
+
+    // CONFIRM: collect one candidate packet, then require the next byte to be
+    // another status candidate. Two confirmations = three starts 3 bytes
+    // apart, which is cheap and very unlikely to happen by chance on data.
+    if (data->packet_idx < 3) {
+        data->packet_buffer[data->packet_idx++] = byte;
+        return;
+    }
+
+    if (!zmk_mouse_ps2_status_candidate(byte, data->resync_relaxed)) {
+        data->packet_idx = 0;
+        data->resync_state = MOUSE_PS2_RESYNC_SCAN;
+        data->resync_confirm = 0;
+        return;
+    }
+
+    data->resync_confirm++;
+    if (data->resync_confirm < 2) {
+        data->packet_buffer[0] = byte;
+        data->packet_idx = 1;
+        return;
+    }
+
+    // Aligned. This byte starts a fresh packet; the candidate packets used to
+    // prove the boundary are deliberately never reported as movement.
+    data->packet_buffer[0] = byte;
+    data->packet_idx = 1;
+    data->resync_state = MOUSE_PS2_RESYNC_ALIGNED;
+    data->resync_confirm = 0;
+    data->resync_bytes = 0;
+    data->resync_relaxed = false;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.resync_done++;
+#endif
+    LOG_WRN("PS/2 resync complete: aligned on a packet boundary t=%u", k_uptime_get_32());
+}
+
+#endif /* CONFIG_ZMK_INPUT_MOUSE_PS2_HOLD_ON_DROP */
+
+// Called by the gpio-ps2 backend when a byte was lost mid-transmission. The
+// backend queues this in stream order between the byte callbacks, so the
+// assembler can drop exactly the right partial packet.
+void zmk_mouse_ps2_activity_read_error_callback(const struct device *dev,
+                                                const struct device *ps2_device) {
+    ARG_UNUSED(ps2_device);
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_HOLD_ON_DROP)
+    struct zmk_mouse_ps2_data *data = dev->data;
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
+    ps2_mouse_stats.drops++;
+#endif
+
+    LOG_WRN("PS/2 byte lost at pkt_idx=%d; holding cursor until resync t=%u", data->packet_idx,
+            k_uptime_get_32());
+
+    zmk_mouse_ps2_resync_enter(dev);
+#else
+    ARG_UNUSED(dev);
+#endif
+}
 
 // Called by the PS/2 driver whenver the mouse sends a byte and
 // reporting is enabled through `zmk_mouse_ps2_activity_reporting_enable`.
@@ -360,6 +518,14 @@ void zmk_mouse_ps2_activity_callback(const struct device *dev,
     k_work_cancel_delayable(&data->packet_buffer_timeout);
 
     // LOG_DBG("Received mouse movement data: 0x%x", byte);
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_HOLD_ON_DROP)
+    if (data->resync_state != MOUSE_PS2_RESYNC_ALIGNED) {
+        zmk_mouse_ps2_resync_byte(dev, byte);
+        k_work_schedule(&data->packet_buffer_timeout, MOUSE_PS2_TIMEOUT_ACTIVITY_PACKET);
+        return;
+    }
+#endif
 
     data->packet_buffer[data->packet_idx] = byte;
 
@@ -410,6 +576,11 @@ void zmk_mouse_ps2_activity_abort_cmd(const struct device *dev, char *reason) {
 
     data->packet_idx = 0;
     zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_HOLD_ON_DROP)
+    // No resend can fix this device: hold movement until the packet phase is
+    // proven again instead of starting a bogus packet on the next data byte.
+    zmk_mouse_ps2_resync_enter(dev);
+#endif
 #else
     LOG_ERR("PS/2 Mouse cmd buffer is out of aligment. Requesting resend: %s", reason);
 
@@ -452,6 +623,18 @@ void zmk_mouse_ps2_activity_packet_timout(struct k_work *item) {
 
 #if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_TELEMETRY)
     ps2_mouse_stats.buf_timeouts++;
+#endif
+
+#if IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_HOLD_ON_DROP)
+    // A long idle gap is itself a packet boundary: the next byte is a status
+    // byte, so there is no reason to keep holding (or scanning) after it.
+    if (data->resync_state != MOUSE_PS2_RESYNC_ALIGNED) {
+        LOG_WRN("PS/2 resync idle timeout; next packet starts fresh t=%u", k_uptime_get_32());
+        data->resync_state = MOUSE_PS2_RESYNC_ALIGNED;
+        data->resync_confirm = 0;
+        data->resync_bytes = 0;
+        data->resync_relaxed = false;
+    }
 #endif
 
     // Reset the cmd buffer in case we are out of alignment.
@@ -2113,6 +2296,19 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
         return;
     }
 
+    k_work_init_delayable(&data->packet_buffer_timeout, zmk_mouse_ps2_activity_packet_timout);
+
+#if IS_ENABLED(CONFIG_PS2_GPIO) && IS_ENABLED(CONFIG_ZMK_INPUT_MOUSE_PS2_HOLD_ON_DROP)
+    // Exp80: get notified, in stream order, when the gpio-ps2 backend loses a
+    // byte. The backend cannot use Zephyr's resend callback here: the pinned
+    // v4.1.0+zmk-fixes still has the one-argument ps2_config().
+    err = ps2_gpio_set_read_error_callback(config->ps2_device,
+                                           data->activity_read_error_callback);
+    if (err) {
+        LOG_WRN("Could not register PS/2 read-error callback: %d", err);
+    }
+#endif
+
     LOG_INF("Enabling data reporting and ps2 callback...");
     err = zmk_mouse_ps2_activity_reporting_enable(dev);
     if (err) {
@@ -2120,8 +2316,6 @@ static void zmk_mouse_ps2_init_thread(int dev_ptr, int unused) {
     } else {
         LOG_DBG("Successfully activated ps2 callback");
     }
-
-    k_work_init_delayable(&data->packet_buffer_timeout, zmk_mouse_ps2_activity_packet_timout);
 
     return;
 }
@@ -2243,7 +2437,8 @@ int zmk_mouse_ps2_init_wait_for_mouse(const struct device *dev) {
 // will assign to zmk_mouse_ps2_data in below
 #define PS2_MOUSE_CALLBACK_DEFINE(n)                                                          \
     void zmk_mouse_ps2_activity_callback##n(const struct device *ps2_device, uint8_t byte);   \
-    void zmk_mouse_ps2_activity_resend_callback##n(const struct device *ps2_device);
+    void zmk_mouse_ps2_activity_resend_callback##n(const struct device *ps2_device);         \
+    void zmk_mouse_ps2_activity_read_error_callback##n(const struct device *ps2_device);
 
 DT_INST_FOREACH_STATUS_OKAY(PS2_MOUSE_CALLBACK_DEFINE)
 
@@ -2274,6 +2469,7 @@ DT_INST_FOREACH_STATUS_OKAY(PS2_MOUSE_CALLBACK_DEFINE)
         .tp_pts_threshold = MOUSE_PS2_CMD_TP_SET_PTS_THRESHOLD_DEFAULT,                       \
         .activity_callback = &zmk_mouse_ps2_activity_callback##n,                             \
         .activity_resend_callback = &zmk_mouse_ps2_activity_resend_callback##n,               \
+        .activity_read_error_callback = &zmk_mouse_ps2_activity_read_error_callback##n,        \
     };                                                                                        \
     static const struct zmk_mouse_ps2_config config##n = {                                    \
         .ps2_device = DEVICE_DT_GET(DT_INST_PHANDLE(n, ps2_device)),                          \
@@ -2318,6 +2514,9 @@ DT_INST_FOREACH_STATUS_OKAY(ZMK_PS2_MOUSE_DEFINE)
     }                                                                                         \
     void zmk_mouse_ps2_activity_resend_callback##n(const struct device *ps2_device) {         \
         zmk_mouse_ps2_activity_resend_callback(data##n.dev, ps2_device);                      \
+    }                                                                                         \
+    void zmk_mouse_ps2_activity_read_error_callback##n(const struct device *ps2_device) {     \
+        zmk_mouse_ps2_activity_read_error_callback(data##n.dev, ps2_device);                  \
     }
 
 DT_INST_FOREACH_STATUS_OKAY(PS2_MOUSE_CALLBACK_IMPL_DEFINE)

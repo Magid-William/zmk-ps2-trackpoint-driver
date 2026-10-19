@@ -99,6 +99,21 @@ config ZMK_INPUT_MOUSE_PS2_DELTA_MAX
 	  NOTE: this also clips genuine single fast flicks (unlike SLEW_MAX,
 	  which exempts sustained big deltas). Exp77: 100.
 
+config ZMK_INPUT_MOUSE_PS2_HOLD_ON_DROP
+	bool "Hold the pointer when a PS/2 byte is lost (gpio-ps2)"
+	default y if ZMK_INPUT_MOUSE_PS2_NO_HOST_COMMANDS
+	help
+	  In NO_HOST_COMMANDS mode the backend cannot ask the device to resend a
+	  byte that failed parity/stop/timing. Without help the 3-byte packet
+	  assembler keeps the partial packet, the next packet completes it, and a
+	  plausible-looking bogus packet moves the cursor.
+
+	  When enabled, the gpio-ps2 backend reports a lost byte in stream order;
+	  the input driver drops the partial packet and suppresses movement until
+	  it has confirmed three packet starts exactly 3 bytes apart. The cost is
+	  a short cursor hold (roughly 2-3 packets) after a drop. Requires the
+	  gpio-ps2 backend.
+
 config ZMK_INPUT_MOUSE_PS2_TELEMETRY
 	bool "Print 1s decode counters (input driver + ps2-gpio backend)"
 	default n
