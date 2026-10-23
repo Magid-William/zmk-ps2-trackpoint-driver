@@ -1254,6 +1254,23 @@ int zmk_mouse_ps2_activity_reporting_disable(const struct device *dev) {
 }
 
 /*
+ * Exp81: power-policy entry points.
+ *
+ * The trackpoint can be unpowered between uses, but a rail cycle is not a
+ * lost byte: the 3-byte assembler has to be cleared too, or the first packet
+ * after power-up can complete a stale partial packet and move the cursor.
+ */
+int zmk_mouse_ps2_power_suspend(const struct device *dev) {
+    zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+    return zmk_mouse_ps2_activity_reporting_disable(dev);
+}
+
+int zmk_mouse_ps2_power_resume(const struct device *dev) {
+    zmk_mouse_ps2_activity_reset_packet_buffer(dev);
+    return zmk_mouse_ps2_activity_reporting_enable(dev);
+}
+
+/*
  * PS/2 Command Helpers
  */
 
