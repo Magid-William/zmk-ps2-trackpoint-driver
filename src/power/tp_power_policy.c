@@ -14,6 +14,12 @@
  *   SLEEP  -> same as IDLE; the pin configuration survives into System OFF,
  *             so the PS/2 pull-ups cannot leak into the unpowered module
  *
+ * USB overrides the idle cut: VBUS has no battery budget, and ZMK already
+ * refuses to deep sleep on USB for the same reason. The rail is switched on
+ * as soon as VBUS appears (plugging in while idle emits no activity event),
+ * stays on for as long as USB is present, and falls back to the activity
+ * state on unplug.
+ *
  * Consequence, by design: once the rail is off the trackpoint is blind, so
  * the next key press (not the nub) brings it back.
  *
@@ -41,6 +47,11 @@
 #include <zmk/event_manager.h>
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/input_mouse_ps2.h>
+
+#if IS_ENABLED(CONFIG_ZMK_USB)
+#include <zmk/events/usb_conn_state_changed.h>
+#include <zmk/usb.h>
+#endif
 
 LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 
@@ -128,6 +139,14 @@ static void tp_power_on(void) {
     LOG_INF("TP power: on (mute %d ms)", CONFIG_ZMK_PS2_TP_POWER_BOOT_MUTE_MS);
 }
 
+static bool tp_usb_powered(void) {
+#if IS_ENABLED(CONFIG_ZMK_USB)
+    return zmk_usb_is_powered();
+#else
+    return false;
+#endif
+}
+
 static int tp_power_activity_listener(const zmk_event_t *eh) {
     const struct zmk_activity_state_changed *ev = as_zmk_activity_state_changed(eh);
 
@@ -135,7 +154,8 @@ static int tp_power_activity_listener(const zmk_event_t *eh) {
         return -ENOTSUP;
     }
 
-    if (ev->state == ZMK_ACTIVITY_ACTIVE) {
+    /* USB has no battery budget: never cut the rail while VBUS is present. */
+    if (ev->state == ZMK_ACTIVITY_ACTIVE || tp_usb_powered()) {
         tp_power_on();
     } else {
         tp_power_off();
@@ -146,6 +166,29 @@ static int tp_power_activity_listener(const zmk_event_t *eh) {
 
 ZMK_LISTENER(tp_power_policy, tp_power_activity_listener);
 ZMK_SUBSCRIPTION(tp_power_policy, zmk_activity_state_changed);
+
+#if IS_ENABLED(CONFIG_ZMK_USB)
+static int tp_power_usb_listener(const zmk_event_t *eh) {
+    const struct zmk_usb_conn_state_changed *ev = as_zmk_usb_conn_state_changed(eh);
+
+    if (ev == NULL) {
+        return -ENOTSUP;
+    }
+
+    if (ev->conn_state != ZMK_USB_CONN_NONE) {
+        /* Plugging in while idle raises no activity event: arm it here. */
+        tp_power_on();
+    } else if (zmk_activity_get_state() != ZMK_ACTIVITY_ACTIVE) {
+        /* Unplugged and already idle: do not wait for the next timer tick. */
+        tp_power_off();
+    }
+
+    return 0;
+}
+
+ZMK_LISTENER(tp_power_usb, tp_power_usb_listener);
+ZMK_SUBSCRIPTION(tp_power_usb, zmk_usb_conn_state_changed);
+#endif
 
 static int tp_power_policy_init(void) {
     if (!gpio_is_ready_dt(&tp_rail) || !device_is_ready(tp_input)) {
