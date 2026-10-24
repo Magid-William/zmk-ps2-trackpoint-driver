@@ -48,7 +48,7 @@
 #include <zmk/events/activity_state_changed.h>
 #include <zmk/input_mouse_ps2.h>
 
-#if IS_ENABLED(CONFIG_ZMK_USB)
+#if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
 #include <zmk/events/usb_conn_state_changed.h>
 #include <zmk/usb.h>
 #endif
@@ -140,7 +140,7 @@ static void tp_power_on(void) {
 }
 
 static bool tp_usb_powered(void) {
-#if IS_ENABLED(CONFIG_ZMK_USB)
+#if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
     return zmk_usb_is_powered();
 #else
     return false;
@@ -167,7 +167,7 @@ static int tp_power_activity_listener(const zmk_event_t *eh) {
 ZMK_LISTENER(tp_power_policy, tp_power_activity_listener);
 ZMK_SUBSCRIPTION(tp_power_policy, zmk_activity_state_changed);
 
-#if IS_ENABLED(CONFIG_ZMK_USB)
+#if IS_ENABLED(CONFIG_USB_DEVICE_STACK)
 static int tp_power_usb_listener(const zmk_event_t *eh) {
     const struct zmk_usb_conn_state_changed *ev = as_zmk_usb_conn_state_changed(eh);
 
@@ -210,3 +210,4 @@ static int tp_power_policy_init(void) {
 SYS_INIT(tp_power_policy_init, APPLICATION, 91);
 
 #endif /* required devicetree nodes present */
+
